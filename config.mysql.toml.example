@@ -1,0 +1,19 @@
+# MySQL 配置示例
+listen = ":8096"
+environment = "development"
+debug = true
+
+[database]
+  type = "mysql"
+  host = "localhost"
+  port = 3306
+  username = "root"
+  password = "your_password"
+  database = "bili_up"
+  ssl_mode = "disable"
+  timezone = "Asia/Shanghai"
+
+[auth]
+  jwt_secret = "your-jwt-secret-key"
+  jwt_expiration = 24
+  session_secret = "your-session-secret"

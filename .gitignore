@@ -1,0 +1,56 @@
+# 数据库文件
+*.db 
+
+# 配置文件 (保留示例文件)
+config.toml
+!config.toml.example
+!config.mysql.toml.example
+!config.postgres.toml.example
+
+# IDE 文件
+.idea/
+.vscode/
+*.swp
+*.swo
+node_modules
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+logs/
+*.log
+
+# 构建产物
+ytb2bili-*
+bili-up-api-server
+bili_up_backend
+dist/
+build/
+
+# 依赖
+node_modules/
+vendor/
+
+output/
+# 临时文件
+*.tmp
+*.temp
+.env
+.env.local
+
+# 上传文件
+uploads/
+media/
+data/
+
+# 测试覆盖率
+*.out
+coverage.html
+
+# Docker
+.dockerignore
+
+models/*.bin
+*.bak

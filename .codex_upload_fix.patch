@@ -1,0 +1,435 @@
+diff --git a/go.mod b/go.mod
+--- a/go.mod
++++ b/go.mod
+@@ -2,6 +2,8 @@ module github.com/difyz9/ytb2bili
+ go 1.24.0
+ 
+ toolchain go1.24.1
++
++replace github.com/difyz9/bilibili-go-sdk => ./third_party/bilibili-go-sdk
+ 
+ require (
+diff --git a/internal/bilibiliutil/options.go b/internal/bilibiliutil/options.go
+new file mode 100644
+--- /dev/null
++++ b/internal/bilibiliutil/options.go
+@@ -0,0 +1,22 @@
++package bilibiliutil
++
++import (
++	"time"
++
++	"github.com/difyz9/bilibili-go-sdk/bilibili"
++	coretypes "github.com/difyz9/ytb2bili/internal/core/types"
++)
++
++// BuildOptions 为 Bilibili SDK 构建统一的超时和代理配置。
++func BuildOptions(config *coretypes.AppConfig, timeout time.Duration) []bilibili.Option {
++	var opts []bilibili.Option
++	if timeout > 0 {
++		opts = append(opts, bilibili.WithTimeout(timeout))
++	}
++
++	if config != nil && config.ProxyConfig != nil && config.ProxyConfig.UseProxy && config.ProxyConfig.ProxyHost != "" {
++		opts = append(opts, bilibili.WithProxy(config.ProxyConfig.ProxyHost))
++	}
++
++	return opts
++}
+diff --git a/third_party/bilibili-go-sdk/bilibili/config.go b/third_party/bilibili-go-sdk/bilibili/config.go
+--- a/third_party/bilibili-go-sdk/bilibili/config.go
++++ b/third_party/bilibili-go-sdk/bilibili/config.go
+@@ -2,6 +2,7 @@
+ package bilibili
+ 
+ import (
+ 	"net/http"
++	"net/url"
+ 	"time"
+ )
+@@ -56,14 +57,30 @@ func DefaultConfig() *Config {
+ 	}
+ }
+ 
++func applyProxyTransport(client *http.Client, proxyURL string) {
++	if client == nil || proxyURL == "" {
++		return
++	}
++
++	parsedURL, err := url.Parse(proxyURL)
++	if err != nil {
++		return
++	}
++
++	transport := http.DefaultTransport.(*http.Transport).Clone()
++	if existing, ok := client.Transport.(*http.Transport); ok && existing != nil {
++		transport = existing.Clone()
++	}
++
++	transport.Proxy = http.ProxyURL(parsedURL)
++	client.Transport = transport
++}
++
+ // ApplyOptions 应用配置选项
+ func (c *Config) ApplyOptions(opts ...Option) {
+ 	for _, opt := range opts {
+ 		opt(c)
+ 	}
+-	
++
+ 	// 应用超时时间到HTTP客户端
+-	if c.HTTPClient != nil {
+-		c.HTTPClient.Timeout = c.Timeout
++	if c.HTTPClient == nil {
++		c.HTTPClient = &http.Client{}
+ 	}
++	c.HTTPClient.Timeout = c.Timeout
++	applyProxyTransport(c.HTTPClient, c.ProxyURL)
+ }
+diff --git a/third_party/bilibili-go-sdk/bilibili/upload.go b/third_party/bilibili-go-sdk/bilibili/upload.go
+--- a/third_party/bilibili-go-sdk/bilibili/upload.go
++++ b/third_party/bilibili-go-sdk/bilibili/upload.go
+@@ -6,6 +6,7 @@ import (
+ 	"math"
+ 	"math/rand"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+@@ -19,6 +20,23 @@ type UploadClient struct {
+ 	loginInfo    *LoginInfo
+ }
+ 
++func buildUploadTransport(proxyURL string) *http.Transport {
++	transport := http.DefaultTransport.(*http.Transport).Clone()
++	transport.MaxIdleConns = 10
++	transport.MaxIdleConnsPerHost = 5
++	transport.IdleConnTimeout = 30 * time.Second
++	transport.DisableCompression = true
++
++	if proxyURL != "" {
++		parsedURL, err := url.Parse(proxyURL)
++		if err == nil {
++			transport.Proxy = http.ProxyURL(parsedURL)
++		}
++	}
++
++	return transport
++}
++
+ // NewUploadClient 创建上传客户端
+ func NewUploadClient(loginInfo *LoginInfo, opts ...Option) *UploadClient {
+ 	config := DefaultConfig()
+@@ -26,15 +44,8 @@ func NewUploadClient(loginInfo *LoginInfo, opts ...Option) *UploadClient {
+ 
+ 	// 创建专门用于上传的客户端，优化网络参数
+-	transport := &http.Transport{
+-		MaxIdleConns:        10,
+-		MaxIdleConnsPerHost: 5,
+-		IdleConnTimeout:     30 * time.Second,
+-		DisableCompression:  true, // 禁用压缩以减少CPU使用
+-	}
+-	
+ 	uploadClient := &http.Client{
+ 		Timeout:   15 * time.Minute, // 增加超时时间到15分钟
+-		Transport: transport,
++		Transport: buildUploadTransport(config.ProxyURL),
+ 	}
+ 
+diff --git a/internal/chain_task/handlers/upload_to_bilibili.go b/internal/chain_task/handlers/upload_to_bilibili.go
+--- a/internal/chain_task/handlers/upload_to_bilibili.go
++++ b/internal/chain_task/handlers/upload_to_bilibili.go
+@@ -8,12 +8,22 @@ import (
+ 	"path/filepath"
+ 	"regexp"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/difyz9/bilibili-go-sdk/bilibili"
++	"github.com/difyz9/ytb2bili/internal/bilibiliutil"
+ 	"github.com/difyz9/ytb2bili/internal/chain_task/base"
+ 	"github.com/difyz9/ytb2bili/internal/chain_task/manager"
+ 	"github.com/difyz9/ytb2bili/internal/core"
+ 	"github.com/difyz9/ytb2bili/internal/core/services"
+ 	"github.com/difyz9/ytb2bili/internal/storage"
+ 	"github.com/difyz9/ytb2bili/pkg/cos"
+ 	"github.com/difyz9/ytb2bili/pkg/utils"
+ )
++
++const (
++	bilibiliUploadAPITimeout       = 2 * time.Minute
++	bilibiliVideoUploadMaxAttempts = 3
++	bilibiliCoverUploadMaxAttempts = 2
++	bilibiliSubmitMaxAttempts      = 3
++)
+@@ -169,11 +179,8 @@ func (t *UploadToBilibili) Execute(context map[string]interface{}) bool {
+ 	videoPath := videoFiles[0] // 使用第一个视频文件
+ 	t.App.Logger.Infof("?? 找到视频文件: %s", filepath.Base(videoPath))
+ 
+-	// 4. 创建上传客户端
+-	uploadClient := bilibili.NewUploadClient(loginInfo)
+-
+-	// 5. 上传视频文件到 Bilibili
++	// 4. 上传视频文件到 Bilibili
+ 	t.App.Logger.Info("? 开始上传视频到 Bilibili...")
+-	video, err := uploadClient.UploadVideo(videoPath)
++	video, err := t.uploadVideoWithRetry(loginInfo, videoPath)
+ 	if err != nil {
+ 		userFriendlyError := t.getUserFriendlyError(err, "上传视频")
+ 		t.App.Logger.Errorf("? 上传视频失败: %v", err)
+@@ -186,7 +193,7 @@ func (t *UploadToBilibili) Execute(context map[string]interface{}) bool {
+ 	t.App.Logger.Infof("  Filename: %s", video.Filename)
+ 	t.App.Logger.Infof("  Title: %s", video.Title)
+ 
+-	// 6. 上传封面 (如果有)
++	// 5. 上传封面 (如果有)
+ 	coverURL := ""
+ 	if coverImagePath, ok := context["cover_image_path"].(string); ok && coverImagePath != "" {
+ 		t.App.Logger.Infof("?? 找到封面图片: %s", filepath.Base(coverImagePath))
+@@ -194,7 +201,7 @@ func (t *UploadToBilibili) Execute(context map[string]interface{}) bool {
+-		uploadedCoverURL, err := uploadClient.UploadCover(coverImagePath)
++		uploadedCoverURL, err := t.uploadCoverWithRetry(loginInfo, coverImagePath)
+ 		if err != nil {
+ 			t.App.Logger.Errorf("? 上传封面失败: %v", err)
+ 			t.App.Logger.Warn("?? 将使用默认封面或截取视频画面")
+@@ -204,15 +211,15 @@ func (t *UploadToBilibili) Execute(context map[string]interface{}) bool {
+ 		}
+ 	}
+ 
+-	// 7. 准备投稿信息 (组装 Studio)
++	// 6. 准备投稿信息 (组装 Studio)
+ 	studio := t.buildStudioInfo(video, coverURL, context)
+ 
+-	// 8. 提交视频到 Bilibili
++	// 7. 提交视频到 Bilibili
+ 	t.App.Logger.Info("?? 提交视频投稿信息...")
+ 	t.App.Logger.Debugf("投稿标题: %s", studio.Title)
+ 	t.App.Logger.Debugf("投稿分区: %d", studio.Tid)
+-	
+-	result, err := uploadClient.SubmitVideo(studio)
++
++	result, err := t.submitVideoWithRetry(loginInfo, studio)
+ 	if err != nil {
+ 		userFriendlyError := t.getUserFriendlyError(err, "提交视频")
+ 		t.App.Logger.Errorf("? 提交视频失败: %v", err)
+@@ -624,6 +631,102 @@ func (t *UploadToBilibili) buildStudioInfo(video *bilibili.Video, coverURL stri
+ 	return studio
+ }
+ 
++func (t *UploadToBilibili) newUploadClient(loginInfo *bilibili.LoginInfo) *bilibili.UploadClient {
++	return bilibili.NewUploadClient(loginInfo, bilibiliutil.BuildOptions(t.App.Config, bilibiliUploadAPITimeout)...)
++}
++
++func (t *UploadToBilibili) uploadVideoWithRetry(loginInfo *bilibili.LoginInfo, videoPath string) (*bilibili.Video, error) {
++	var uploadedVideo *bilibili.Video
++	err := t.retryUploadOperation("上传视频", bilibiliVideoUploadMaxAttempts, func() error {
++		client := t.newUploadClient(loginInfo)
++		var uploadErr error
++		uploadedVideo, uploadErr = client.UploadVideo(videoPath)
++		return uploadErr
++	})
++	if err != nil {
++		return nil, err
++	}
++	return uploadedVideo, nil
++}
++
++func (t *UploadToBilibili) uploadCoverWithRetry(loginInfo *bilibili.LoginInfo, coverImagePath string) (string, error) {
++	var coverURL string
++	err := t.retryUploadOperation("上传封面", bilibiliCoverUploadMaxAttempts, func() error {
++		client := t.newUploadClient(loginInfo)
++		var uploadErr error
++		coverURL, uploadErr = client.UploadCover(coverImagePath)
++		return uploadErr
++	})
++	return coverURL, err
++}
++
++func (t *UploadToBilibili) submitVideoWithRetry(loginInfo *bilibili.LoginInfo, studio *bilibili.Studio) (*bilibili.ResponseData, error) {
++	var result *bilibili.ResponseData
++	err := t.retryUploadOperation("提交视频", bilibiliSubmitMaxAttempts, func() error {
++		client := t.newUploadClient(loginInfo)
++		var submitErr error
++		result, submitErr = client.SubmitVideo(studio)
++		if submitErr != nil {
++			return submitErr
++		}
++		if result == nil {
++			return fmt.Errorf("submit returned empty result")
++		}
++		if result.Code != 0 && t.shouldRetrySubmitResult(result) {
++			return fmt.Errorf("submit failed: code=%d, message=%s", result.Code, result.Message)
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return result, nil
++}
++
++func (t *UploadToBilibili) retryUploadOperation(operation string, maxAttempts int, fn func() error) error {
++	var lastErr error
++	for attempt := 1; attempt <= maxAttempts; attempt++ {
++		lastErr = fn()
++		if lastErr == nil {
++			if attempt > 1 {
++				t.App.Logger.Infof("? %s在第 %d 次尝试后成功", operation, attempt)
++			}
++			return nil
++		}
++
++		if attempt == maxAttempts || !t.shouldRetryUploadError(lastErr) {
++			return lastErr
++		}
++
++		delay := time.Duration(attempt*attempt*3) * time.Second
++		t.App.Logger.Warnf("?? %s失败，第 %d/%d 次: %v；将在 %s 后重试", operation, attempt, maxAttempts, lastErr, delay)
++		time.Sleep(delay)
++	}
++
++	return lastErr
++}
++
++func (t *UploadToBilibili) shouldRetryUploadError(err error) bool {
++	if err == nil {
++		return false
++	}
++	if bilibili.IsNetworkError(err) || bilibili.IsRateLimitError(err) {
++		return true
++	}
++
++	errorStr := strings.ToLower(err.Error())
++	retryableHints := []string{"timeout", "deadline exceeded", "temporarily unavailable", "service unavailable", "internal server error", "server error", "connection reset", "broken pipe", "eof", "too many requests", "try again", "dns", "no such host", "502", "503", "504", "频繁", "稍后", "繁忙", "超时", "网络"}
++	for _, hint := range retryableHints {
++		if strings.Contains(errorStr, hint) {
++			return true
++		}
++	}
++
++	return false
++}
++
++func (t *UploadToBilibili) shouldRetrySubmitResult(result *bilibili.ResponseData) bool {
++	if result == nil {
++		return false
++	}
++
++	message := strings.ToLower(result.Message)
++	if result.Code == -799 {
++		return true
++	}
++
++	retryableHints := []string{"频繁", "稍后", "繁忙", "timeout", "busy", "service unavailable", "server error", "too many requests"}
++	for _, hint := range retryableHints {
++		if strings.Contains(message, hint) {
++			return true
++		}
++	}
++
++	return false
++}
++
+ // truncateString 截断字符串用于日志显示
+ func (t *UploadToBilibili) truncateString(s string, maxLen int) string {
+ 	runes := []rune(s)
+diff --git a/internal/chain_task/handlers/upload_subtitle_to_bilibili.go b/internal/chain_task/handlers/upload_subtitle_to_bilibili.go
+--- a/internal/chain_task/handlers/upload_subtitle_to_bilibili.go
++++ b/internal/chain_task/handlers/upload_subtitle_to_bilibili.go
+@@ -1,13 +1,16 @@
+ package handlers
+ 
+ import (
++	"os"
++	"path/filepath"
++	"time"
++
++	"github.com/difyz9/bilibili-go-sdk/bilibili"
++	"github.com/difyz9/ytb2bili/internal/bilibiliutil"
+ 	"github.com/difyz9/ytb2bili/internal/chain_task/base"
+ 	"github.com/difyz9/ytb2bili/internal/chain_task/manager"
+ 	"github.com/difyz9/ytb2bili/internal/core"
+ 	"github.com/difyz9/ytb2bili/internal/core/services"
+ 	"github.com/difyz9/ytb2bili/internal/storage"
+-	"github.com/difyz9/bilibili-go-sdk/bilibili"
+ 	"github.com/difyz9/ytb2bili/pkg/cos"
+-	"os"
+-	"path/filepath"
+ )
+@@ -72,7 +75,7 @@ func (t *UploadSubtitleToBilibili) Execute(context map[string]interface{}) bool {
+ 	}
+ 
+ 	// 4. 创建 Bilibili 客户端和字幕上传器
+-	client := bilibili.NewClient()
++	client := bilibili.NewClient(bilibiliutil.BuildOptions(t.App.Config, 2*time.Minute)...)
+ 	uploader := bilibili.NewSubtitleUploader(client, loginInfo)
+ 
+ 	// 5. 上传字幕文件
+diff --git a/internal/handler/upload_handler.go b/internal/handler/upload_handler.go
+--- a/internal/handler/upload_handler.go
++++ b/internal/handler/upload_handler.go
+@@ -1,16 +1,24 @@
+ package handler
+ 
+ import (
+-	"github.com/difyz9/ytb2bili/internal/core"
+-	bilibili2 "github.com/difyz9/bilibili-go-sdk/bilibili"
+-	"github.com/difyz9/ytb2bili/pkg/cos"
+ 	"encoding/json"
+ 	"log"
+ 	"net/http"
+ 	"os"
+ 	"path/filepath"
++	"time"
++
++	bilibili2 "github.com/difyz9/bilibili-go-sdk/bilibili"
++	"github.com/difyz9/ytb2bili/internal/bilibiliutil"
++	"github.com/difyz9/ytb2bili/internal/core"
++	"github.com/difyz9/ytb2bili/pkg/cos"
+ 
+ 	"github.com/gin-gonic/gin"
+ )
++
++const manualUploadAPITimeout = 2 * time.Minute
+ 
+ type UploadHandler struct {
+ 	BaseHandler
+ }
+@@ -23,6 +31,10 @@ func NewUploadHandler(app *core.AppServer) *UploadHandler {
+ 	}
+ }
++
++func (h *UploadHandler) newUploadClient(loginInfo *bilibili2.LoginInfo) *bilibili2.UploadClient {
++	return bilibili2.NewUploadClient(loginInfo, bilibiliutil.BuildOptions(h.App.Config, manualUploadAPITimeout)...)
++}
+ 
+ // RegisterRoutes 注册上传相关路由
+ func (h *UploadHandler) RegisterRoutes(server *core.AppServer) {
+@@ -116,7 +128,7 @@ func (h *UploadHandler) uploadVideo(c *gin.Context) {
+ 	log.Printf("? COS upload successful: key=%s, url=%s", cosKey, cosURL)
+ 
+ 	// 2. 从 COS URL 直接上传到 Bilibili（不使用临时文件）
+-	uploadClient := bilibili2.NewUploadClient(&loginInfo)
++	uploadClient := h.newUploadClient(&loginInfo)
+ 
+ 	log.Printf("?? Uploading to Bilibili from COS URL: %s", cosURL)
+ 	video, err := uploadClient.UploadVideoFromURL(cosURL, file.Filename, file.Size)
+@@ -204,7 +216,7 @@ func (h *UploadHandler) uploadCover(c *gin.Context) {
+ 	// 确保在函数结束时删除临时文件
+ 	defer os.Remove(tempPath)
+ 
+-	uploadClient := bilibili2.NewUploadClient(&loginInfo)
++	uploadClient := h.newUploadClient(&loginInfo)
+ 
+ 	coverURL, err := uploadClient.UploadCover(tempPath)
+ 	if err != nil {
+@@ -249,7 +261,7 @@ func (h *UploadHandler) submitVideo(c *gin.Context) {
+ 
+ 	log.Printf("Submit video request: Studio=%+v", req.Studio)
+ 
+-	uploadClient := bilibili2.NewUploadClient(req.LoginInfo)
++	uploadClient := h.newUploadClient(req.LoginInfo)
+ 
+ 	result, err := uploadClient.SubmitVideo(req.Studio)
+ 	if err != nil {

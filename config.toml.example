@@ -1,0 +1,66 @@
+# Bilibili 视频上传后端 - 配置文件
+
+# ======================
+# 基础配置
+# ======================
+listen = ":8096"              # HTTP 服务监听端口
+environment = "development"   # 运行环境: development, production
+debug = true                  # 是否启用调试模式
+FileUpDir = "/Users/apple/opt/file_upload/media"  # 文件上传目录（绝对路径）
+
+# ======================
+# 数据库配置
+# ======================
+[database]
+  type = "mysql"              # 数据库类型: mysql, postgres
+  host = "localhost"          # 数据库主机
+  port = 3306                 # 数据库端口
+  username = "root"           # 数据库用户名
+  password = "Ab123456"       # 数据库密码
+  database = "bili_up"        # 数据库名称
+  ssl_mode = "disable"        # SSL 模式
+  timezone = "Asia/Shanghai"  # 时区
+
+# ======================
+# JWT 认证配置
+# ======================
+[auth]
+  jwt_secret = "your-jwt-secret-key"      # JWT 密钥（生产环境请修改）
+  jwt_expiration = 24                     # JWT 过期时间（小时）
+  session_secret = "your-session-secret"  # Session 密钥（生产环境请修改）
+
+# ======================
+# 腾讯云 COS 存储配置
+# ======================
+[TenCosConfig]
+  enabled = true                                                                  # 是否启用腾讯云 COS 存储
+  CosBucketURL = "https://your-bucket.cos.ap-guangzhou.myqcloud.com"            # COS Bucket URL
+  CosSecretId = "your-secret-id"                                                 # 腾讯云 SecretId
+  CosSecretKey = "your-secret-key"                                               # 腾讯云 SecretKey
+  CosRegion = "ap-guangzhou"                                                     # COS 地域
+  CosBucket = "your-bucket"                                                      # Bucket 名称
+  SubAppId = "your-appid"                                                        # 子应用ID
+  CosUrL = "https://your-bucket.cos.ap-guangzhou.myqcloud.com"                  # COS 访问URL
+
+# ======================
+# 数据分析配置
+# ======================
+[AnalyticsConfig]
+  enabled = false                           # 是否启用数据分析
+  server_url = "http://localhost:8080"      # 分析服务器地址
+  api_key = "your-analytics-api-key"        # API密钥
+  product_id = "bili-up-api"                # 产品ID
+  debug = false                             # 是否启用调试模式
+  encryption_key = ""                       # AES加密密钥（可选，16/24/32字节）
+                                            # 示例: "1234567890123456" (16字节)
+
+# ======================
+# 说明
+# ======================
+# 以下配置已内置在代码中，无需在此配置文件中设置：
+#
+# 1. BaiduTransConfig - 百度翻译服务
+# 2. DeepSeekTransConfig - DeepSeek AI 服务（可通过API动态配置）
+# 3. app_auth - 应用启动认证
+#
+# 详细说明请参考: docs/CONFIG_GUIDE.md

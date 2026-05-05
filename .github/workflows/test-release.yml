@@ -1,0 +1,79 @@
+name: Test Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v0.0.5-test)'
+        required: true
+        default: 'v0.0.5-test'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test-release:
+    name: Test Release Creation
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Build simple binary
+      run: |
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ytb2bili-test .
+
+    - name: Create test package
+      run: |
+        mkdir -p test-package
+        cp ytb2bili-test test-package/
+        cp config.toml.example test-package/config.toml
+        echo "Test release package" > test-package/README.txt
+        tar -czf ytb2bili-test.tar.gz -C test-package .
+        ls -la ytb2bili-test.tar.gz
+
+    - name: Create test changelog
+      run: |
+        cat > TEST_CHANGELOG.md << EOF
+        ## 🧪 Test Release ${{ github.event.inputs.version }}
+        
+        This is a test release to verify the GitHub Actions workflow.
+        
+        ### 📦 Package Contents
+        - \`ytb2bili-test\` - Test binary
+        - \`config.toml\` - Configuration template
+        - \`README.txt\` - Basic instructions
+        
+        **Build Time**: $(date -u '+%Y-%m-%d %H:%M:%S') UTC
+        EOF
+
+    - name: Check GitHub token permissions
+      run: |
+        echo "Checking GitHub API access..."
+        curl -H "Authorization: token ${{ secrets.MGITHUB_TOKEN }}" \
+             -H "Accept: application/vnd.github.v3+json" \
+             "https://api.github.com/repos/${{ github.repository }}"
+
+    - name: Create Test Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.inputs.version }}
+        name: "Test Release ${{ github.event.inputs.version }}"
+        body_path: TEST_CHANGELOG.md
+        files: ytb2bili-test.tar.gz
+        draft: true
+        prerelease: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.MGITHUB_TOKEN }}
+
+    - name: Success notification
+      run: |
+        echo "🎉 Test release created successfully!"
+        echo "Check: https://github.com/${{ github.repository }}/releases"
