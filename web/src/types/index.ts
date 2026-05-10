@@ -12,6 +12,11 @@ export interface Video {
   title: string;
   url: string;
   status: VideoStatus;
+  chapters?: string;
+  chapters_status?: string;
+  chapters_message?: string;
+  chapters_extracted?: boolean;
+  chapters_count?: number;
   created_at: string;
   updated_at: string;
   subtitles?: Subtitle[];
@@ -56,8 +61,14 @@ export interface VideoDetail {
   status: VideoStatus;
   created_at: string;
   updated_at: string;
+  chapters?: string;
+  chapters_status?: string;
+  chapters_message?: string;
+  chapters_extracted?: boolean;
+  chapters_count?: number;
   generated_title?: string;
   generated_description?: string;
+  generated_desc?: string;
   generated_tags?: string;
   cover_image?: string;
   task_steps: TaskStep[];

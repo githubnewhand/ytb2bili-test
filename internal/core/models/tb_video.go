@@ -17,8 +17,9 @@ type TbVideo struct {
 	Duration      float64 `gorm:"column:duration;type:float;default:0" json:"duration"`
 	OperationType int     `gorm:"column:operation_type;type:int" json:"operationType"`
 	Description   string  `gorm:"column:description;type:text" json:"description"`
-	SortOrder     int     `gorm:"not null;default:0" json:"sorOrder"` // 视频排序
-	BiliTid       int     `gorm:"column:bili_tid;type:int;default:0" json:"biliTid"`// B站分区ID
+	Chapters      string  `gorm:"column:chapters;type:text" json:"chapters"`
+	SortOrder     int     `gorm:"not null;default:0" json:"sorOrder"`                // 视频排序
+	BiliTid       int     `gorm:"column:bili_tid;type:int;default:0" json:"biliTid"` // B站分区ID
 
 	CreatedAt  time.Time `json:"createdAt"`
 	UpdatedAt  time.Time `json:"updatedAt"`

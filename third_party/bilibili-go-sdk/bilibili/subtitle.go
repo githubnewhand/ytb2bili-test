@@ -3,13 +3,22 @@ package bilibili
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+)
+
+const (
+	subtitleLanguageChinese            = "zh"
+	subtitleLanguageEnglish            = "en"
+	subtitleAlreadyUploadedCode        = 79001
+	subtitleAlreadyUploadedActiveError = "已上传生效"
 )
 
 // SubtitleUploader Bilibili字幕上传器
@@ -49,6 +58,20 @@ type SubtitleSaveResponse struct {
 	TTL     int    `json:"ttl"`
 }
 
+// SubtitleAPIError Bilibili字幕接口错误
+type SubtitleAPIError struct {
+	Operation string
+	Code      int
+	Message   string
+}
+
+func (e *SubtitleAPIError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s failed: code=%d, message=%s", e.Operation, e.Code, e.Message)
+}
+
 // VideoInfoResponse 视频信息响应
 type VideoInfoResponse struct {
 	Code    int    `json:"code"`
@@ -75,7 +98,7 @@ func NewSubtitleUploader(client *Client, loginInfo *LoginInfo) *SubtitleUploader
 // GetVideoInfo 获取视频信息（CID和AID）
 func (s *SubtitleUploader) GetVideoInfo(bvid string) (*SubtitleVideoInfo, error) {
 	url := fmt.Sprintf("https://member.bilibili.com/x/vupre/web/archive/view?bvid=%s", bvid)
-	
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request failed: %w", err)
@@ -208,6 +231,8 @@ func (s *SubtitleUploader) SaveSubtitleInfo(aid, cid int64, location, language s
 		return fmt.Errorf("get CSRF token failed: %w", err)
 	}
 
+	language = normalizeSubtitleLanguage(language)
+
 	// 构建字幕文件信息
 	subtitleFiles := []SubtitleFile{
 		{
@@ -265,7 +290,11 @@ func (s *SubtitleUploader) SaveSubtitleInfo(aid, cid int64, location, language s
 	}
 
 	if response.Code != 0 {
-		return fmt.Errorf("save subtitle info failed: code=%d, message=%s", response.Code, response.Message)
+		return &SubtitleAPIError{
+			Operation: "save subtitle info",
+			Code:      response.Code,
+			Message:   response.Message,
+		}
 	}
 
 	return nil
@@ -273,6 +302,8 @@ func (s *SubtitleUploader) SaveSubtitleInfo(aid, cid int64, location, language s
 
 // UploadSubtitle 完整的字幕上传流程
 func (s *SubtitleUploader) UploadSubtitle(bvid, subtitlePath, language string) error {
+	language = normalizeSubtitleLanguage(language)
+
 	// 1. 获取视频信息
 	videoInfo, err := s.GetVideoInfo(bvid)
 	if err != nil {
@@ -298,4 +329,32 @@ func (s *SubtitleUploader) UploadSubtitle(bvid, subtitlePath, language string) e
 func (c *Client) UploadSubtitle(loginInfo *LoginInfo, bvid, subtitlePath, language string) error {
 	uploader := NewSubtitleUploader(c, loginInfo)
 	return uploader.UploadSubtitle(bvid, subtitlePath, language)
+}
+
+func normalizeSubtitleLanguage(language string) string {
+	switch language {
+	case "zh-CN", "zh_CN", "zh-Hans", "zh-Hans-CN":
+		return subtitleLanguageChinese
+	case "en-US", "en_US":
+		return subtitleLanguageEnglish
+	default:
+		return language
+	}
+}
+
+// IsSubtitleAlreadyUploadedError reports whether Bilibili says this language already has an active subtitle.
+func IsSubtitleAlreadyUploadedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var apiErr *SubtitleAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Code == subtitleAlreadyUploadedCode &&
+			strings.Contains(apiErr.Message, subtitleAlreadyUploadedActiveError)
+	}
+
+	errMsg := err.Error()
+	return strings.Contains(errMsg, fmt.Sprintf("code=%d", subtitleAlreadyUploadedCode)) &&
+		strings.Contains(errMsg, subtitleAlreadyUploadedActiveError)
 }

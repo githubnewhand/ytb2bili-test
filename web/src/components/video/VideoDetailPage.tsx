@@ -13,6 +13,67 @@ interface VideoDetailPageProps {
   onBack: () => void;
 }
 
+const CHAPTER_STATUS_META: Record<string, {
+  label: string;
+  badgeClassName: string;
+  panelClassName: string;
+  iconClassName: string;
+}> = {
+  extracted: {
+    label: '已提取',
+    badgeClassName: 'bg-green-100 text-green-800',
+    panelClassName: 'bg-green-50 border-green-200',
+    iconClassName: 'text-green-600',
+  },
+  used_existing: {
+    label: '沿用已有',
+    badgeClassName: 'bg-cyan-100 text-cyan-800',
+    panelClassName: 'bg-cyan-50 border-cyan-200',
+    iconClassName: 'text-cyan-600',
+  },
+  no_match: {
+    label: '未匹配',
+    badgeClassName: 'bg-yellow-100 text-yellow-800',
+    panelClassName: 'bg-yellow-50 border-yellow-200',
+    iconClassName: 'text-yellow-600',
+  },
+  translation_failed: {
+    label: '翻译失败',
+    badgeClassName: 'bg-red-100 text-red-800',
+    panelClassName: 'bg-red-50 border-red-200',
+    iconClassName: 'text-red-600',
+  },
+  save_failed: {
+    label: '保存失败',
+    badgeClassName: 'bg-red-100 text-red-800',
+    panelClassName: 'bg-red-50 border-red-200',
+    iconClassName: 'text-red-600',
+  },
+  empty_result: {
+    label: '结果为空',
+    badgeClassName: 'bg-yellow-100 text-yellow-800',
+    panelClassName: 'bg-yellow-50 border-yellow-200',
+    iconClassName: 'text-yellow-600',
+  },
+  skipped: {
+    label: '已跳过',
+    badgeClassName: 'bg-gray-100 text-gray-800',
+    panelClassName: 'bg-gray-50 border-gray-200',
+    iconClassName: 'text-gray-500',
+  },
+  not_extracted: {
+    label: '未提取',
+    badgeClassName: 'bg-gray-100 text-gray-800',
+    panelClassName: 'bg-gray-50 border-gray-200',
+    iconClassName: 'text-gray-500',
+  },
+};
+
+function getChaptersStatusMeta(status?: string, extracted?: boolean) {
+  const normalizedStatus = status || (extracted ? 'extracted' : 'not_extracted');
+  return CHAPTER_STATUS_META[normalizedStatus] || CHAPTER_STATUS_META.not_extracted;
+}
+
 export default function VideoDetailPage({ videoId, onBack }: VideoDetailPageProps) {
   const [video, setVideo] = useState<VideoDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -161,6 +222,19 @@ export default function VideoDetailPage({ videoId, onBack }: VideoDetailPageProp
     );
   }
 
+  const generatedDescription = video.generated_description || video.generated_desc || '';
+  const chapterLines = (video.chapters || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+  const chaptersExtracted = Boolean(video.chapters_extracted || chapterLines.length > 0);
+  const chaptersCount = Math.max(video.chapters_count ?? 0, chapterLines.length);
+  const chaptersStatusMeta = getChaptersStatusMeta(video.chapters_status, chaptersExtracted);
+  const chaptersMessage = video.chapters_message || (
+    chaptersExtracted ? `已提取 ${chaptersCount} 条章节` : '尚未提取到章节'
+  );
+  const chapterPreviewLines = chapterLines.slice(0, 8);
+
   return (
     <div className="min-h-screen bg-gray-50 py-6">
       <div className="container mx-auto px-4 max-w-6xl">
@@ -226,11 +300,11 @@ export default function VideoDetailPage({ videoId, onBack }: VideoDetailPageProp
               </div>
 
               {/* 描述信息 */}
-              {video.generated_description && (
+              {generatedDescription && (
                 <div className="mb-4">
                   <h3 className="text-sm font-medium text-gray-900 mb-2">生成的描述</h3>
                   <div className="p-3 bg-gray-50 rounded-lg text-sm text-gray-700 whitespace-pre-wrap">
-                    {video.generated_description}
+                    {generatedDescription}
                   </div>
                 </div>
               )}
@@ -251,6 +325,42 @@ export default function VideoDetailPage({ videoId, onBack }: VideoDetailPageProp
                   </div>
                 </div>
               )}
+
+              {/* 章节提取 */}
+              <div className="mb-4">
+                <div className="flex items-center justify-between gap-3 mb-2">
+                  <h3 className="text-sm font-medium text-gray-900">章节提取</h3>
+                  <span className={`inline-flex items-center px-2 py-1 text-xs font-medium rounded ${chaptersStatusMeta.badgeClassName}`}>
+                    {chaptersStatusMeta.label}
+                  </span>
+                </div>
+                <div className={`border rounded-lg p-3 ${chaptersStatusMeta.panelClassName}`}>
+                  <div className="flex items-start gap-3">
+                    <FileText className={`w-4 h-4 mt-0.5 flex-shrink-0 ${chaptersStatusMeta.iconClassName}`} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                        <span className="font-medium text-gray-900">
+                          {chaptersCount > 0 ? `${chaptersCount} 条章节` : '暂无章节'}
+                        </span>
+                        {video.chapters_status && (
+                          <span className="text-xs text-gray-500">
+                            {video.chapters_status}
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1 text-sm text-gray-700">
+                        {chaptersMessage}
+                      </p>
+                      {chapterPreviewLines.length > 0 && (
+                        <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded border border-gray-200 bg-white/80 p-3 text-xs leading-5 text-gray-700">
+                          {chapterPreviewLines.join('\n')}
+                          {chapterLines.length > chapterPreviewLines.length ? '\n...' : ''}
+                        </pre>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
 
               {/* 原始URL */}
               <div>

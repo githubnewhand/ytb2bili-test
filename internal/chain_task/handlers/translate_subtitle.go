@@ -552,7 +552,7 @@ func (t *TranslateSubtitle) callDeepSeekAPI(systemPrompt, userPrompt string) (st
 	// 添加调试日志，显示当前使用的API Key（用于验证热更新是否生效）
 	t.App.Logger.Debugf("🔑 当前使用API Key: %s", maskAPIKey(currentAPIKey))
 
-	client := NewDeepSeekClient(currentAPIKey)
+	client := NewDeepSeekClientWithConfig(currentAPIKey, t.App.Config)
 	response, err := client.ChatCompletion(systemPrompt, userPrompt)
 	if err != nil {
 		return "", fmt.Errorf("调用DeepSeek API失败: %v", err)

@@ -50,7 +50,7 @@ func (g *GenerateMetadata) getCurrentDeepSeekClient() (*DeepSeekClient, error) {
 		return nil, fmt.Errorf("DeepSeek API Key 未配置")
 	}
 
-	return NewDeepSeekClient(apiKey), nil
+	return NewDeepSeekClientWithConfig(apiKey, g.App.Config), nil
 }
 
 type VideoMetadata struct {

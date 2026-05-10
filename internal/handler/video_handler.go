@@ -76,6 +76,11 @@ type VideoInfo struct {
 	Title          string                 `json:"title"`
 	URL            string                 `json:"url"`
 	Status         string                 `json:"status"`
+	Chapters       string                 `json:"chapters"`
+	ChaptersStatus string                 `json:"chapters_status"`
+	ChaptersMessage string                `json:"chapters_message"`
+	ChaptersExtracted bool                `json:"chapters_extracted"`
+	ChaptersCount int                    `json:"chapters_count"`
 	GeneratedTitle string                 `json:"generated_title"`
 	GeneratedDesc  string                 `json:"generated_desc"`
 	GeneratedTags  string                 `json:"generated_tags"`
@@ -91,16 +96,17 @@ type VideoInfo struct {
 
 // TaskStepInfo 任务步骤信息
 type TaskStepInfo struct {
-	StepName        string `json:"step_name"`
-	StepOrder       int    `json:"step_order"`
-	Status          string `json:"status"`
-	StartTime       string `json:"start_time"`
-	EndTime         string `json:"end_time"`
-	Duration        int64  `json:"duration"`
-	ProgressPercent int    `json:"progress_percent"`
-	ProgressMessage string `json:"progress_message"`
-	ErrorMsg        string `json:"error_msg"`
-	CanRetry        bool   `json:"can_retry"`
+	StepName        string                 `json:"step_name"`
+	StepOrder       int                    `json:"step_order"`
+	Status          string                 `json:"status"`
+	StartTime       string                 `json:"start_time"`
+	EndTime         string                 `json:"end_time"`
+	Duration        int64                  `json:"duration"`
+	ProgressPercent int                    `json:"progress_percent"`
+	ProgressMessage string                 `json:"progress_message"`
+	ErrorMsg        string                 `json:"error_msg"`
+	ResultData      map[string]interface{} `json:"result_data,omitempty"`
+	CanRetry        bool                   `json:"can_retry"`
 }
 
 // getVideoList 获取视频列表
@@ -140,21 +146,27 @@ func (h *VideoHandler) getVideoList(c *gin.Context) {
 		if progressErr != nil {
 			h.App.Logger.Warnf("获取任务进度失败 videoID=%s: %v", sv.VideoID, progressErr)
 		}
+		chaptersDetail := buildVideoChaptersDetail(&sv, nil)
 
 		videos = append(videos, VideoInfo{
-			ID:             sv.ID,
-			VideoID:        sv.VideoID,
-			Title:          sv.Title,
-			URL:            sv.URL,
-			Status:         sv.Status,
-			GeneratedTitle: sv.GeneratedTitle,
-			GeneratedDesc:  sv.GeneratedDesc,
-			GeneratedTags:  sv.GeneratedTags,
-			BiliBVID:       sv.BiliBVID,
-			BiliAID:        sv.BiliAID,
-			CreatedAt:      sv.CreatedAt.Format("2006-01-02 15:04:05"),
-			UpdatedAt:      sv.UpdatedAt.Format("2006-01-02 15:04:05"),
-			Progress:       progress,
+			ID:                sv.ID,
+			VideoID:           sv.VideoID,
+			Title:             sv.Title,
+			URL:               sv.URL,
+			Status:            sv.Status,
+			Chapters:          chaptersDetail.Chapters,
+			ChaptersStatus:    chaptersDetail.Status,
+			ChaptersMessage:   chaptersDetail.Message,
+			ChaptersExtracted: chaptersDetail.Extracted,
+			ChaptersCount:     chaptersDetail.Count,
+			GeneratedTitle:    sv.GeneratedTitle,
+			GeneratedDesc:     sv.GeneratedDesc,
+			GeneratedTags:     sv.GeneratedTags,
+			BiliBVID:          sv.BiliBVID,
+			BiliAID:           sv.BiliAID,
+			CreatedAt:         sv.CreatedAt.Format("2006-01-02 15:04:05"),
+			UpdatedAt:         sv.UpdatedAt.Format("2006-01-02 15:04:05"),
+			Progress:          progress,
 		})
 	}
 
@@ -221,6 +233,14 @@ func (h *VideoHandler) getVideoDetail(c *gin.Context) {
 		if step.EndTime != nil {
 			stepInfo.EndTime = step.EndTime.Format("2006-01-02 15:04:05")
 		}
+		if strings.TrimSpace(step.ResultData) != "" {
+			var resultData map[string]interface{}
+			if err := json.Unmarshal([]byte(step.ResultData), &resultData); err != nil {
+				h.App.Logger.Warnf("解析任务步骤结果失败 videoID=%s step=%s: %v", savedVideo.VideoID, step.StepName, err)
+			} else {
+				stepInfo.ResultData = resultData
+			}
+		}
 
 		taskStepInfos = append(taskStepInfos, stepInfo)
 	}
@@ -236,24 +256,30 @@ func (h *VideoHandler) getVideoDetail(c *gin.Context) {
 
 	// 获取封面图片
 	coverImage := h.getVideoCoverImage(savedVideo.VideoID)
+	chaptersDetail := buildVideoChaptersDetail(savedVideo, taskStepInfos)
 
 	videoInfo := VideoInfo{
-		ID:             savedVideo.ID,
-		VideoID:        savedVideo.VideoID,
-		Title:          savedVideo.Title,
-		URL:            savedVideo.URL,
-		Status:         savedVideo.Status,
-		GeneratedTitle: savedVideo.GeneratedTitle,
-		GeneratedDesc:  savedVideo.GeneratedDesc,
-		GeneratedTags:  savedVideo.GeneratedTags,
-		BiliBVID:       savedVideo.BiliBVID,
-		BiliAID:        savedVideo.BiliAID,
-		CreatedAt:      savedVideo.CreatedAt.Format("2006-01-02 15:04:05"),
-		UpdatedAt:      savedVideo.UpdatedAt.Format("2006-01-02 15:04:05"),
-		TaskSteps:      taskStepInfos,
-		Progress:       progress,
-		CoverImage:     coverImage,
-		MetaData:       metaData,
+		ID:                savedVideo.ID,
+		VideoID:           savedVideo.VideoID,
+		Title:             savedVideo.Title,
+		URL:               savedVideo.URL,
+		Status:            savedVideo.Status,
+		Chapters:          chaptersDetail.Chapters,
+		ChaptersStatus:    chaptersDetail.Status,
+		ChaptersMessage:   chaptersDetail.Message,
+		ChaptersExtracted: chaptersDetail.Extracted,
+		ChaptersCount:     chaptersDetail.Count,
+		GeneratedTitle:    savedVideo.GeneratedTitle,
+		GeneratedDesc:     savedVideo.GeneratedDesc,
+		GeneratedTags:     savedVideo.GeneratedTags,
+		BiliBVID:          savedVideo.BiliBVID,
+		BiliAID:           savedVideo.BiliAID,
+		CreatedAt:         savedVideo.CreatedAt.Format("2006-01-02 15:04:05"),
+		UpdatedAt:         savedVideo.UpdatedAt.Format("2006-01-02 15:04:05"),
+		TaskSteps:         taskStepInfos,
+		Progress:          progress,
+		CoverImage:        coverImage,
+		MetaData:          metaData,
 	}
 
 	c.JSON(http.StatusOK, VideoListResponse{
@@ -261,6 +287,118 @@ func (h *VideoHandler) getVideoDetail(c *gin.Context) {
 		Message: "success",
 		Data:    videoInfo,
 	})
+}
+
+type videoChaptersDetail struct {
+	Chapters  string
+	Status    string
+	Message   string
+	Extracted bool
+	Count     int
+}
+
+func buildVideoChaptersDetail(savedVideo *model.SavedVideo, taskSteps []TaskStepInfo) videoChaptersDetail {
+	chapters := ""
+	if savedVideo != nil {
+		chapters = strings.TrimSpace(savedVideo.Chapters)
+	}
+
+	detail := videoChaptersDetail{
+		Chapters:  chapters,
+		Count:     countNonEmptyLines(chapters),
+		Extracted: chapters != "",
+		Status:    "not_extracted",
+		Message:   "尚未提取到章节",
+	}
+	if detail.Extracted {
+		detail.Status = "extracted"
+		detail.Message = fmt.Sprintf("已保存 %d 条章节", detail.Count)
+	}
+
+	if result := latestChaptersExtractionResult(taskSteps); result != nil {
+		if status, ok := result["status"].(string); ok && strings.TrimSpace(status) != "" {
+			detail.Status = status
+		}
+		if message, ok := result["message"].(string); ok && strings.TrimSpace(message) != "" {
+			detail.Message = message
+		}
+		if count, ok := intFromJSONValue(result["chapter_count"]); ok && count > detail.Count {
+			detail.Count = count
+		}
+		if hasChapters, ok := result["has_chapters"].(bool); ok && hasChapters {
+			detail.Extracted = true
+		}
+		if success, ok := result["success"].(bool); ok && success && detail.Count > 0 {
+			detail.Extracted = true
+		}
+	}
+
+	if detail.Chapters != "" {
+		detail.Count = countNonEmptyLines(detail.Chapters)
+		detail.Extracted = true
+	}
+	if detail.Extracted && detail.Status == "not_extracted" {
+		detail.Status = "extracted"
+	}
+	if detail.Extracted && strings.TrimSpace(detail.Message) == "" {
+		detail.Message = fmt.Sprintf("已提取 %d 条章节", detail.Count)
+	}
+
+	return detail
+}
+
+func latestChaptersExtractionResult(taskSteps []TaskStepInfo) map[string]interface{} {
+	for i := len(taskSteps) - 1; i >= 0; i-- {
+		if taskSteps[i].ResultData == nil {
+			continue
+		}
+		result, ok := normalizeMapValue(taskSteps[i].ResultData["chapters_result"])
+		if ok {
+			return result
+		}
+	}
+	return nil
+}
+
+func normalizeMapValue(value interface{}) (map[string]interface{}, bool) {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		return typed, true
+	case string:
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(typed), &result); err == nil {
+			return result, true
+		}
+	}
+	return nil, false
+}
+
+func intFromJSONValue(value interface{}) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		number, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(number), true
+	}
+	return 0, false
+}
+
+func countNonEmptyLines(text string) int {
+	count := 0
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 // retryTaskStep 重新执行任务步骤

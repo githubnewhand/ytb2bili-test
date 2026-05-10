@@ -343,9 +343,11 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 		// 不再在这里检查配置，让任务运行时动态检查最新配置
 		task = handlers.NewGenerateMetadata("生成元数据", h.App, stateManager, h.App.CosClient, "", h.Db, h.SavedVideoService)
 	case "上传到Bilibili":
-		task = handlers.NewUploadToBilibili("上传到Bilibili", h.App, stateManager, h.App.CosClient, h.SavedVideoService)
+		chain.AddTask(handlers.NewExtractChaptersHandler("提取视频章节", h.App, stateManager, h.App.CosClient, h.SavedVideoService))
+		chain.AddTask(handlers.NewUploadToBilibili("上传到Bilibili", h.App, stateManager, h.App.CosClient, h.SavedVideoService))
 	case "上传字幕到Bilibili":
-		task = handlers.NewUploadSubtitleToBilibili("上传字幕到Bilibili", h.App, stateManager, h.App.CosClient, h.SavedVideoService)
+		chain.AddTask(handlers.NewUploadSubtitleToBilibili("上传字幕到Bilibili", h.App, stateManager, h.App.CosClient, h.SavedVideoService))
+		chain.AddTask(handlers.NewPublishCommentHandler("发布章节评论", h.App, stateManager, h.App.CosClient, h.SavedVideoService))
 	default:
 		return fmt.Errorf("未知的任务步骤: %s", stepName)
 	}
@@ -360,7 +362,7 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 	h.App.Logger.Infof("开始执行单个任务步骤: %s (VideoID: %s)", stepName, videoID)
 
 	// 执行任务
-	result := chain.Run(false)
+	result := chain.Run(true)
 
 	// 检查执行结果
 	success := true

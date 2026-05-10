@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bufio"
+	"bytes"
 	stdctx "context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/difyz9/ytb2bili/internal/chain_task/base"
@@ -31,6 +33,12 @@ type DownloadVideo struct {
 	SavedVideoService *services.SavedVideoService
 }
 
+type recentLineBuffer struct {
+	mu    sync.Mutex
+	limit int
+	lines []string
+}
+
 const (
 	downloadOverallTimeout = 4 * time.Hour
 	downloadIdleTimeout    = 10 * time.Minute
@@ -38,6 +46,44 @@ const (
 )
 
 var ytDlpProgressPattern = regexp.MustCompile(`\[download\]\s+([0-9]+(?:\.[0-9]+)?)%`)
+
+func newRecentLineBuffer(limit int) *recentLineBuffer {
+	return &recentLineBuffer{limit: limit}
+}
+
+func (b *recentLineBuffer) Add(line string) {
+	if b == nil {
+		return
+	}
+
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+	if len([]rune(line)) > 300 {
+		runes := []rune(line)
+		line = string(runes[:300]) + "..."
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.lines = append(b.lines, line)
+	if b.limit > 0 && len(b.lines) > b.limit {
+		b.lines = b.lines[len(b.lines)-b.limit:]
+	}
+}
+
+func (b *recentLineBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return strings.Join(b.lines, "\n")
+}
 
 func NewDownloadVideo(name string, app *core.AppServer, stateManager *manager.StateManager, client *cos.CosClient, savedVideoService *services.SavedVideoService) *DownloadVideo {
 	return &DownloadVideo{
@@ -227,6 +273,10 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 		"--fragment-retries", "3",
 	}
 
+	if _, err := exec.LookPath("node"); err == nil {
+		command = append(command, "--js-runtimes", "node")
+	}
+
 	// 查找最新的 cookies 文件（优先使用用户提交的）
 	cookiesPath := t.findLatestCookiesFile()
 
@@ -285,14 +335,17 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 
 	activityCh := make(chan struct{}, 1)
 
+	recentOutput := newRecentLineBuffer(12)
+
 	// 实时读取输出
-	go t.logOutput(stdout, "INFO", activityCh, context)
-	go t.logOutput(stderr, "ERROR", activityCh, context)
+	go t.logOutput(stdout, "INFO", activityCh, context, recentOutput)
+	go t.logOutput(stderr, "ERROR", activityCh, context, recentOutput)
 
 	// 等待命令完成
 	if err := t.waitForDownload(cmd, cmdCtx, activityCh); err != nil {
-		t.App.Logger.Errorf("❌ 视频下载失败: %v", err)
-		context["error"] = fmt.Sprintf("下载失败: %v", err)
+		errMsg := t.formatDownloadError(err, recentOutput.String())
+		t.App.Logger.Errorf("❌ 视频下载失败: %s", errMsg)
+		context["error"] = errMsg
 		return false
 	}
 
@@ -383,8 +436,26 @@ func (t *DownloadVideo) waitForDownload(cmd *exec.Cmd, cmdCtx stdctx.Context, ac
 	}
 }
 
+func (t *DownloadVideo) formatDownloadError(err error, recentOutput string) string {
+	baseMsg := fmt.Sprintf("下载失败: %v", err)
+	recentOutput = strings.TrimSpace(recentOutput)
+	if recentOutput == "" {
+		return baseMsg
+	}
+
+	lowerOutput := strings.ToLower(recentOutput)
+	switch {
+	case strings.Contains(lowerOutput, "sign in to confirm") && strings.Contains(lowerOutput, "not a bot"):
+		return "下载失败: YouTube 要求登录验证，通常是当前 VPN 出口 IP 被风控。请更换非数据中心节点，或导入当前浏览器的 YouTube cookies 后重试。\n" + recentOutput
+	case strings.Contains(lowerOutput, "proxy") || strings.Contains(lowerOutput, "connection refused"):
+		return "下载失败: 代理连接异常，请检查代理地址和端口。\n" + recentOutput
+	default:
+		return baseMsg + "\n" + recentOutput
+	}
+}
+
 // logOutput 实时输出日志
-func (t *DownloadVideo) logOutput(reader io.Reader, level string, activityCh chan<- struct{}, context map[string]interface{}) {
+func (t *DownloadVideo) logOutput(reader io.Reader, level string, activityCh chan<- struct{}, context map[string]interface{}, recentOutput *recentLineBuffer) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	for scanner.Scan() {
@@ -392,6 +463,9 @@ func (t *DownloadVideo) logOutput(reader io.Reader, level string, activityCh cha
 		line := scanner.Text()
 		if line == "" {
 			continue
+		}
+		if level == "ERROR" || strings.Contains(line, "ERROR:") || strings.Contains(line, "WARNING:") {
+			recentOutput.Add(line)
 		}
 
 		// 解析进度信息
@@ -510,13 +584,16 @@ func (t *DownloadVideo) getVideoMetadata(ytdlpPath string) (*VideoMetadataInfo, 
 	videoURL := t.getVideoURL()
 
 	// 构建基础命令参数
-	args := []string{"--dump-json", "--no-download"}
+	baseArgs := []string{"--dump-json", "--no-download"}
+	if _, err := exec.LookPath("node"); err == nil {
+		baseArgs = append(baseArgs, "--js-runtimes", "node")
+	}
 
 	// 添加 cookies 支持（使用最新的用户提交的 cookies）
 	cookiesPath := t.findLatestCookiesFile()
 
 	if cookiesPath != "" {
-		args = append(args, "--cookies", cookiesPath)
+		baseArgs = append(baseArgs, "--cookies", cookiesPath)
 		t.App.Logger.Debugf("🍪 使用 Cookies 文件获取元数据: %s", cookiesPath)
 	} else {
 		t.App.Logger.Debug("No cookies file found; fetching metadata without cookies")
@@ -526,6 +603,7 @@ func (t *DownloadVideo) getVideoMetadata(ytdlpPath string) (*VideoMetadataInfo, 
 	useProxy := t.App.Config != nil && t.App.Config.ProxyConfig != nil &&
 		t.App.Config.ProxyConfig.UseProxy && t.App.Config.ProxyConfig.ProxyHost != ""
 
+	args := append([]string{}, baseArgs...)
 	if useProxy {
 		args = append(args, "--proxy", t.App.Config.ProxyConfig.ProxyHost)
 		t.App.Logger.Debugf("📡 使用代理获取元数据: %s", t.App.Config.ProxyConfig.ProxyHost)
@@ -539,7 +617,8 @@ func (t *DownloadVideo) getVideoMetadata(ytdlpPath string) (*VideoMetadataInfo, 
 	// 如果使用代理失败，尝试不使用代理
 	if err != nil && useProxy {
 		t.App.Logger.Warnf("⚠️ 使用代理获取元数据失败，尝试不使用代理...")
-		argsNoProxy := []string{"--dump-json", "--no-download", videoURL}
+		argsNoProxy := append([]string{}, baseArgs...)
+		argsNoProxy = append(argsNoProxy, videoURL)
 		output, err = t.runYtDlpOutput(ytdlpPath, argsNoProxy, metadataTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("获取元数据失败: %v", err)
@@ -562,9 +641,17 @@ func (t *DownloadVideo) runYtDlpOutput(ytdlpPath string, args []string, timeout 
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, ytdlpPath, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	output, err := cmd.Output()
 	if cmdCtx.Err() == stdctx.DeadlineExceeded {
 		return nil, fmt.Errorf("yt-dlp 命令超过 %s 未返回", timeout)
+	}
+	if err != nil {
+		errText := strings.TrimSpace(stderr.String())
+		if errText != "" {
+			return nil, fmt.Errorf("%w: %s", err, errText)
+		}
 	}
 	return output, err
 }

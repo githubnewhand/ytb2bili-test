@@ -6,14 +6,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"github.com/difyz9/ytb2bili/internal/core/types"
 )
 
 // DeepSeekClient DeepSeek API客户端
 type DeepSeekClient struct {
 	APIKey     string
 	BaseURL    string
+	Model      string
+	MaxTokens  int
 	Client     *http.Client
 	MaxRetries int
 	RetryDelay time.Duration
@@ -21,10 +26,11 @@ type DeepSeekClient struct {
 
 // DeepSeekRequest API请求结构
 type DeepSeekRequest struct {
-	Model    string            `json:"model"`
-	Messages []DeepSeekMessage `json:"messages"`
-	Stream   bool              `json:"stream"`
-	Settings *DeepSeekSettings `json:"settings,omitempty"`
+	Model       string            `json:"model"`
+	Messages    []DeepSeekMessage `json:"messages"`
+	Stream      bool              `json:"stream"`
+	MaxTokens   int               `json:"max_tokens,omitempty"`
+	Temperature float64           `json:"temperature,omitempty"`
 }
 
 // DeepSeekMessage 消息结构
@@ -65,13 +71,49 @@ type DeepSeekUsage struct {
 
 // NewDeepSeekClient 创建DeepSeek客户端
 func NewDeepSeekClient(apiKey string) *DeepSeekClient {
+	return NewDeepSeekClientWithConfig(apiKey, nil)
+}
+
+// NewDeepSeekClientWithConfig 创建DeepSeek客户端，并应用应用配置中的代理/端点/超时等设置
+func NewDeepSeekClientWithConfig(apiKey string, config *types.AppConfig) *DeepSeekClient {
+	baseURL := "https://api.deepseek.com/v1/chat/completions"
+	model := "deepseek-chat"
+	timeout := 60 * time.Second
+	maxTokens := 4000
+
+	if config != nil && config.DeepSeekTransConfig != nil {
+		deepSeekConfig := config.DeepSeekTransConfig
+		if deepSeekConfig.Endpoint != "" {
+			baseURL = strings.TrimRight(deepSeekConfig.Endpoint, "/") + "/v1/chat/completions"
+		}
+		if deepSeekConfig.Model != "" {
+			model = deepSeekConfig.Model
+		}
+		if deepSeekConfig.Timeout > 0 {
+			timeout = time.Duration(deepSeekConfig.Timeout) * time.Second
+		}
+		if deepSeekConfig.MaxTokens > 0 {
+			maxTokens = deepSeekConfig.MaxTokens
+		}
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if config != nil && config.ProxyConfig != nil && config.ProxyConfig.UseProxy && config.ProxyConfig.ProxyHost != "" {
+		if proxyURL, err := url.Parse(config.ProxyConfig.ProxyHost); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+
 	return &DeepSeekClient{
 		APIKey:     apiKey,
-		BaseURL:    "https://api.deepseek.com/v1/chat/completions",
+		BaseURL:    baseURL,
+		Model:      model,
+		MaxTokens:  maxTokens,
 		MaxRetries: 3,
 		RetryDelay: 2 * time.Second,
 		Client: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout:   timeout,
+			Transport: transport,
 		},
 	}
 }
@@ -104,7 +146,7 @@ func (c *DeepSeekClient) ChatCompletion(systemPrompt, userPrompt string) (string
 // doRequest 执行单次API请求
 func (c *DeepSeekClient) doRequest(systemPrompt, userPrompt string) (string, error) {
 	request := DeepSeekRequest{
-		Model: "deepseek-chat",
+		Model: c.Model,
 		Messages: []DeepSeekMessage{
 			{
 				Role:    "system",
@@ -115,11 +157,9 @@ func (c *DeepSeekClient) doRequest(systemPrompt, userPrompt string) (string, err
 				Content: userPrompt,
 			},
 		},
-		Stream: false,
-		Settings: &DeepSeekSettings{
-			Temperature: 0.3,  // 降低随机性，提高一致性
-			MaxTokens:   4000, // 增加最大token数
-		},
+		Stream:      false,
+		Temperature: 0.3,
+		MaxTokens:   c.MaxTokens,
 	}
 
 	jsonData, err := json.Marshal(request)
@@ -165,7 +205,7 @@ func (c *DeepSeekClient) doRequest(systemPrompt, userPrompt string) (string, err
 // ChatCompletionWithUsage 执行对话补全并返回使用量统计
 func (c *DeepSeekClient) ChatCompletionWithUsage(systemPrompt, userPrompt string) (string, *DeepSeekUsage, error) {
 	request := DeepSeekRequest{
-		Model: "deepseek-chat",
+		Model: c.Model,
 		Messages: []DeepSeekMessage{
 			{
 				Role:    "system",
@@ -176,7 +216,8 @@ func (c *DeepSeekClient) ChatCompletionWithUsage(systemPrompt, userPrompt string
 				Content: userPrompt,
 			},
 		},
-		Stream: false,
+		Stream:    false,
+		MaxTokens: c.MaxTokens,
 	}
 
 	jsonData, err := json.Marshal(request)

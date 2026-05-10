@@ -28,6 +28,10 @@ type UploadSubtitleToBilibili struct {
 }
 
 const maxBilibiliSubtitleRunes = 60
+const (
+	bilibiliSubtitleLanguageChinese = "zh"
+	bilibiliSubtitleLanguageEnglish = "en"
+)
 
 func NewUploadSubtitleToBilibili(name string, app *core.AppServer, stateManager *manager.StateManager, client *cos.CosClient, savedVideoService *services.SavedVideoService) *UploadSubtitleToBilibili {
 	return &UploadSubtitleToBilibili{
@@ -103,6 +107,13 @@ func (t *UploadSubtitleToBilibili) Execute(context map[string]interface{}) bool 
 
 		err := uploader.UploadSubtitle(bvid, subtitleFile.Path, subtitleFile.Language)
 		if err != nil {
+			if bilibili.IsSubtitleAlreadyUploadedError(err) {
+				t.App.Logger.Infof("✅ 字幕已存在，跳过重复上传: %s (%s)", filepath.Base(subtitleFile.Path), subtitleFile.Language)
+				uploadedCount++
+				types.ReportTaskProgress(context, 40+(uploadedCount*45/len(subtitleFiles)), fmt.Sprintf("字幕已存在 %d/%d", uploadedCount, len(subtitleFiles)))
+				continue
+			}
+
 			t.App.Logger.Errorf("❌ 上传字幕失败 %s: %v", subtitleFile.Path, err)
 			uploadErrors = append(uploadErrors, fmt.Sprintf("%s: %v", filepath.Base(subtitleFile.Path), err))
 			// 继续上传其他字幕文件，不因为一个失败就停止
@@ -155,7 +166,7 @@ func (t *UploadSubtitleToBilibili) findSubtitleFiles() []SubtitleFileInfo {
 
 		subtitleFiles = append(subtitleFiles, SubtitleFileInfo{
 			Path:     uploadPath,
-			Language: "zh",
+			Language: bilibiliSubtitleLanguageChinese,
 		})
 		t.App.Logger.Infof("🎯 找到中文字幕文件: %s", filepath.Base(uploadPath))
 	}
@@ -163,7 +174,7 @@ func (t *UploadSubtitleToBilibili) findSubtitleFiles() []SubtitleFileInfo {
 	if enPath := t.findFirstExistingSubtitle([]string{"en.srt", fmt.Sprintf("%s.srt", t.StateManager.VideoID)}); enPath != "" {
 		subtitleFiles = append(subtitleFiles, SubtitleFileInfo{
 			Path:     enPath,
-			Language: "en",
+			Language: bilibiliSubtitleLanguageEnglish,
 		})
 		t.App.Logger.Infof("🎯 找到英文字幕文件: %s", filepath.Base(enPath))
 	}

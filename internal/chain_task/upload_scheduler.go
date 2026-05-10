@@ -202,27 +202,26 @@ func (s *UploadScheduler) executeUploadTask(videoID, taskName string) error {
 
 	// 创建任务链
 	chain := manager.NewTaskChain()
-	var task types.Task
 
 	// 根据任务名称创建对应的任务
 	switch taskName {
 	case "上传到Bilibili":
-		task = handlers.NewUploadToBilibili("上传到Bilibili", s.App, stateManager, s.App.CosClient, s.SavedVideoService)
+		chain.AddTask(handlers.NewExtractChaptersHandler("提取视频章节", s.App, stateManager, s.App.CosClient, s.SavedVideoService))
+		chain.AddTask(handlers.NewUploadToBilibili("上传到Bilibili", s.App, stateManager, s.App.CosClient, s.SavedVideoService))
 	case "上传字幕到Bilibili":
-		task = handlers.NewUploadSubtitleToBilibili("上传字幕到Bilibili", s.App, stateManager, s.App.CosClient, s.SavedVideoService)
+		chain.AddTask(handlers.NewUploadSubtitleToBilibili("上传字幕到Bilibili", s.App, stateManager, s.App.CosClient, s.SavedVideoService))
+		chain.AddTask(handlers.NewPublishCommentHandler("发布章节评论", s.App, stateManager, s.App.CosClient, s.SavedVideoService))
 	default:
 		return fmt.Errorf("未知的任务类型: %s", taskName)
 	}
 
-	// 添加任务到链
-	chain.AddTask(task)
 	chain.Context[types.TaskProgressReporterKey] = newTaskProgressReporter(videoID, taskName, s.TaskStepService, s.logger)
 	types.ReportTaskProgress(chain.Context, 0, "开始执行")
 
 	s.logger.Infof("开始执行上传任务: %s (VideoID: %s)", taskName, videoID)
 
 	// 执行任务
-	result := chain.Run(false)
+	result := chain.Run(true)
 
 	// 检查执行结果
 	success := true

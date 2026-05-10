@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"reflect"
 	"time"
 
 	"github.com/difyz9/ytb2bili/pkg/store/model"
@@ -125,14 +126,62 @@ func (s *TaskStepService) UpdateTaskStepStatus(videoID, stepName, status string,
 func (s *TaskStepService) UpdateTaskStepResult(videoID, stepName string, resultData interface{}) error {
 	var jsonData string
 	if resultData != nil {
-		if jsonBytes, err := json.Marshal(resultData); err == nil {
-			jsonData = string(jsonBytes)
+		jsonBytes, err := json.Marshal(sanitizeTaskStepResultData(resultData))
+		if err != nil {
+			return fmt.Errorf("序列化任务结果失败: %w", err)
 		}
+		jsonData = string(jsonBytes)
 	}
 
 	return s.DB.Model(&model.TaskStep{}).
 		Where("video_id = ? AND step_name = ?", videoID, stepName).
 		Update("result_data", jsonData).Error
+}
+
+func sanitizeTaskStepResultData(value interface{}) interface{} {
+	sanitized, ok := sanitizeTaskStepJSONValue(value)
+	if !ok {
+		return nil
+	}
+	return sanitized
+}
+
+func sanitizeTaskStepJSONValue(value interface{}) (interface{}, bool) {
+	if value == nil {
+		return nil, true
+	}
+
+	switch v := value.(type) {
+	case map[string]interface{}:
+		result := make(map[string]interface{}, len(v))
+		for key, item := range v {
+			if key == "task_progress_reporter" {
+				continue
+			}
+			sanitized, ok := sanitizeTaskStepJSONValue(item)
+			if ok {
+				result[key] = sanitized
+			}
+		}
+		return result, true
+	case []interface{}:
+		result := make([]interface{}, 0, len(v))
+		for _, item := range v {
+			sanitized, ok := sanitizeTaskStepJSONValue(item)
+			if ok {
+				result = append(result, sanitized)
+			}
+		}
+		return result, true
+	}
+
+	kind := reflect.TypeOf(value).Kind()
+	switch kind {
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer, reflect.Complex64, reflect.Complex128:
+		return nil, false
+	}
+
+	return value, true
 }
 
 // UpdateTaskStepProgress 更新运行中任务步骤的实时进度。
