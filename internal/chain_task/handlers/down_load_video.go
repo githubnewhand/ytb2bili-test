@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"bufio"
 	"bytes"
 	stdctx "context"
 	"encoding/json"
@@ -46,6 +45,7 @@ const (
 )
 
 var ytDlpProgressPattern = regexp.MustCompile(`\[download\]\s+([0-9]+(?:\.[0-9]+)?)%`)
+var aria2ProgressPattern = regexp.MustCompile(`\(([0-9]+)%\)`)
 
 func newRecentLineBuffer(limit int) *recentLineBuffer {
 	return &recentLineBuffer{limit: limit}
@@ -116,6 +116,27 @@ func (t *DownloadVideo) findYtDlp() (string, error) {
 	}
 
 	return "", fmt.Errorf("未找到 yt-dlp，请确保已正确安装")
+}
+
+func (t *DownloadVideo) findAria2() (string, bool) {
+	if t.App == nil || t.App.Config == nil || !t.App.Config.Download.UseAria2 {
+		return "", false
+	}
+
+	if t.App.Config.Download.Aria2Path != "" {
+		if _, err := os.Stat(t.App.Config.Download.Aria2Path); err == nil {
+			return t.App.Config.Download.Aria2Path, true
+		}
+		t.App.Logger.Warnf("⚠️ 配置的 aria2c 不存在: %s，将使用 yt-dlp 内置下载器", t.App.Config.Download.Aria2Path)
+		return "", false
+	}
+
+	path, err := exec.LookPath("aria2c")
+	if err != nil {
+		t.App.Logger.Warn("⚠️ 未找到 aria2c，将使用 yt-dlp 内置下载器")
+		return "", false
+	}
+	return path, true
 }
 
 // findLatestCookiesFile 查找最新的 cookies 文件
@@ -275,6 +296,18 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 
 	if _, err := exec.LookPath("node"); err == nil {
 		command = append(command, "--js-runtimes", "node")
+	}
+
+	if aria2Path, ok := t.findAria2(); ok {
+		aria2Args := t.App.Config.Download.Aria2Args
+		if aria2Args == "" {
+			aria2Args = "-x 16 -s 16 -k 1M --file-allocation=none"
+		}
+		command = append(command,
+			"--external-downloader", aria2Path,
+			"--external-downloader-args", "aria2c:"+aria2Args,
+		)
+		t.App.Logger.Infof("🚀 使用 aria2c 加速下载: %s (%s)", aria2Path, aria2Args)
 	}
 
 	// 查找最新的 cookies 文件（优先使用用户提交的）
@@ -456,50 +489,81 @@ func (t *DownloadVideo) formatDownloadError(err error, recentOutput string) stri
 
 // logOutput 实时输出日志
 func (t *DownloadVideo) logOutput(reader io.Reader, level string, activityCh chan<- struct{}, context map[string]interface{}, recentOutput *recentLineBuffer) {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 1024), 1024*1024)
-	for scanner.Scan() {
-		t.markDownloadActivity(activityCh)
-		line := scanner.Text()
-		if line == "" {
-			continue
-		}
-		if level == "ERROR" || strings.Contains(line, "ERROR:") || strings.Contains(line, "WARNING:") {
-			recentOutput.Add(line)
-		}
+	buffer := make([]byte, 4096)
+	var pending strings.Builder
 
-		// 解析进度信息
-		if strings.Contains(line, "[download]") {
-			if strings.Contains(line, "Destination:") {
-				t.App.Logger.Infof("📥 %s", line)
-				types.ReportTaskProgress(context, 6, "定位下载文件")
-			} else if strings.Contains(line, "%") {
-				// 进度信息，使用 Debug 级别避免日志过多
-				t.App.Logger.Debugf("⏳ %s", line)
-				if percent, ok := parseYtDlpProgressPercent(line); ok {
-					mappedPercent := 5 + (percent * 85 / 100)
-					if mappedPercent > 90 {
-						mappedPercent = 90
-					}
-					types.ReportTaskProgress(context, mappedPercent, fmt.Sprintf("下载中 %d%%", percent))
+	for {
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			t.markDownloadActivity(activityCh)
+			for _, r := range string(buffer[:n]) {
+				if r == '\r' || r == '\n' {
+					t.handleDownloadOutputLine(pending.String(), level, context, recentOutput)
+					pending.Reset()
+					continue
 				}
-			} else {
-				t.App.Logger.Infof("📥 %s", line)
+
+				pending.WriteRune(r)
+				if pending.Len() >= 4096 {
+					t.handleDownloadOutputLine(pending.String(), level, context, recentOutput)
+					pending.Reset()
+				}
 			}
-		} else if strings.Contains(line, "[ffmpeg]") {
-			t.App.Logger.Infof("🔄 %s", line)
-			types.ReportTaskProgress(context, 92, "合并视频音频")
-		} else {
-			if level == "ERROR" {
-				t.App.Logger.Warnf("⚠️  %s", line)
-			} else {
-				t.App.Logger.Debugf("%s", line)
+		}
+		if err != nil {
+			if err != io.EOF {
+				t.App.Logger.Debugf("读取下载输出结束: %v", err)
 			}
+			break
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		t.App.Logger.Debugf("读取下载输出结束: %v", err)
+	t.handleDownloadOutputLine(pending.String(), level, context, recentOutput)
+}
+
+func (t *DownloadVideo) handleDownloadOutputLine(line, level string, context map[string]interface{}, recentOutput *recentLineBuffer) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return
+	}
+
+	if level == "ERROR" || strings.Contains(line, "ERROR:") || strings.Contains(line, "WARNING:") {
+		recentOutput.Add(line)
+	}
+
+	if strings.Contains(line, "[download]") {
+		if strings.Contains(line, "Destination:") {
+			t.App.Logger.Infof("📥 %s", line)
+			types.ReportTaskProgress(context, 6, "定位下载文件")
+		} else if strings.Contains(line, "%") {
+			t.App.Logger.Debugf("⏳ %s", line)
+			if percent, ok := parseYtDlpProgressPercent(line); ok {
+				mappedPercent := mapDownloadProgressPercent(percent)
+				types.ReportTaskProgress(context, mappedPercent, fmt.Sprintf("下载中 %d%%", percent))
+			}
+		} else {
+			t.App.Logger.Infof("📥 %s", line)
+		}
+		return
+	}
+
+	if strings.Contains(line, "[ffmpeg]") {
+		t.App.Logger.Infof("🔄 %s", line)
+		types.ReportTaskProgress(context, 92, "合并视频音频")
+		return
+	}
+
+	if percent, ok := parseAria2ProgressPercent(line); ok {
+		t.App.Logger.Debugf("🚀 aria2 %s", line)
+		mappedPercent := mapDownloadProgressPercent(percent)
+		types.ReportTaskProgress(context, mappedPercent, fmt.Sprintf("aria2下载中 %d%%", percent))
+		return
+	}
+
+	if level == "ERROR" {
+		t.App.Logger.Warnf("⚠️  %s", line)
+	} else {
+		t.App.Logger.Debugf("%s", line)
 	}
 }
 
@@ -522,6 +586,40 @@ func parseYtDlpProgressPercent(line string) (int, bool) {
 		return 100, true
 	}
 	return rounded, true
+}
+
+func parseAria2ProgressPercent(line string) (int, bool) {
+	if !strings.Contains(line, "DL:") && !strings.Contains(line, "ETA:") {
+		return 0, false
+	}
+
+	matches := aria2ProgressPattern.FindStringSubmatch(line)
+	if len(matches) != 2 {
+		return 0, false
+	}
+
+	percent, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0, false
+	}
+	if percent < 0 {
+		return 0, true
+	}
+	if percent > 100 {
+		return 100, true
+	}
+	return percent, true
+}
+
+func mapDownloadProgressPercent(percent int) int {
+	mappedPercent := 5 + (percent * 85 / 100)
+	if mappedPercent > 90 {
+		return 90
+	}
+	if mappedPercent < 5 {
+		return 5
+	}
+	return mappedPercent
 }
 
 func (t *DownloadVideo) markDownloadActivity(activityCh chan<- struct{}) {

@@ -1,6 +1,8 @@
 package services
 
 import (
+	"fmt"
+
 	"github.com/difyz9/ytb2bili/pkg/store/model"
 	"gorm.io/gorm"
 )
@@ -52,6 +54,21 @@ func (s *SavedVideoService) UpdateStatus(id uint, status string) error {
 	return s.DB.Model(&model.SavedVideo{}).
 		Where("id = ?", id).
 		Update("status", status).Error
+}
+
+// TryUpdateStatus 原子地将指定状态的视频切换到新状态。
+// 返回 false 表示视频当前状态已经变化，调用方不应继续执行该任务。
+func (s *SavedVideoService) TryUpdateStatus(id uint, fromStatus, toStatus string) (bool, error) {
+	result := s.DB.Model(&model.SavedVideo{}).
+		Where("id = ? AND status = ?", id, fromStatus).
+		Update("status", toStatus)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected > 1 {
+		return false, fmt.Errorf("unexpected rows affected while updating video status: %d", result.RowsAffected)
+	}
+	return result.RowsAffected == 1, nil
 }
 
 // UpdateVideo 更新视频信息

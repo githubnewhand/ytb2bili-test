@@ -10,30 +10,32 @@ import (
 
 // AppConfig 应用程序配置
 type AppConfig struct {
-	Path        string        `toml:"-"`
-	Listen      string        `toml:"listen"`
-	Environment string        `toml:"environment"`
-	Debug       bool          `toml:"debug"`
-	Database    Database      `toml:"database"`
-	Auth        AuthConfig    `toml:"auth"`
-	AppAuth     AppAuthConfig `toml:"app_auth"` // 应用启动认证配置
-	APIAuth     APIAuthConfig `toml:"api_auth"` // API请求认证配置（go-auth）
-	FileUpDir   string        `toml:"fileUpDir"`
-	DataPath    string        `toml:"data_path"`   // 数据存储路径（用于 cookies 等）
-	YtDlpPath   string        `toml:"yt_dlp_path"` // yt-dlp 安装路径
+	Path        string         `toml:"-"`
+	Listen      string         `toml:"listen"`
+	Environment string         `toml:"environment"`
+	Debug       bool           `toml:"debug"`
+	Database    Database       `toml:"database"`
+	Auth        AuthConfig     `toml:"auth"`
+	AppAuth     AppAuthConfig  `toml:"app_auth"` // 应用启动认证配置
+	APIAuth     APIAuthConfig  `toml:"api_auth"` // API请求认证配置（go-auth）
+	TaskConfig  TaskConfig     `toml:"task"`     // 任务调度配置
+	Download    DownloadConfig `toml:"download"` // 下载配置
+	FileUpDir   string         `toml:"fileUpDir"`
+	DataPath    string         `toml:"data_path"`   // 数据存储路径（用于 cookies 等）
+	YtDlpPath   string         `toml:"yt_dlp_path"` // yt-dlp 安装路径
 
-	PrimaryAIService         string                    `toml:"primary_ai_service"`          // 首选AI服务提供商
-	TenCosConfig             *TencentCosConfig         `toml:"TenCosConfig"`                // 腾讯云 COS 存储配置
-	OpenAICompatibleConfig   *OpenAICompatibleConfig   `toml:"OpenAICompatibleConfig"`      // OpenAI兼容API配置
-	BaiduTransConfig    *BaiduTransConfig    `toml:"BaiduTransConfig"`    // 百度翻译服务配置
-	DeepSeekTransConfig *DeepSeekTransConfig `toml:"DeepSeekTransConfig"` // DeepSeek翻译服务配置
-	GeminiConfig        *GeminiConfig        `toml:"GeminiConfig"`        // Gemini多模态服务配置
-	TranslatorConfig    *TranslatorConfig    `toml:"TranslatorConfig"`    // 翻译器总配置
-	ProxyConfig         *ProxyConfig         `toml:"ProxyConfig"`         // 代理配置
-	AnalyticsConfig     *AnalyticsConfig     `toml:"AnalyticsConfig"`     // 数据分析配置
-	BilibiliConfig      *BilibiliConfig      `toml:"BilibiliConfig"`      // Bilibili上传配置
-	WhisperConfig       *WhisperConfig       `toml:"WhisperConfig"`       // Whisper 语音识别配置
-	FirebaseConfig      *FirebaseConfig      `toml:"FirebaseConfig"`      // Firebase Backend配置
+	PrimaryAIService       string                  `toml:"primary_ai_service"`     // 首选AI服务提供商
+	TenCosConfig           *TencentCosConfig       `toml:"TenCosConfig"`           // 腾讯云 COS 存储配置
+	OpenAICompatibleConfig *OpenAICompatibleConfig `toml:"OpenAICompatibleConfig"` // OpenAI兼容API配置
+	BaiduTransConfig       *BaiduTransConfig       `toml:"BaiduTransConfig"`       // 百度翻译服务配置
+	DeepSeekTransConfig    *DeepSeekTransConfig    `toml:"DeepSeekTransConfig"`    // DeepSeek翻译服务配置
+	GeminiConfig           *GeminiConfig           `toml:"GeminiConfig"`           // Gemini多模态服务配置
+	TranslatorConfig       *TranslatorConfig       `toml:"TranslatorConfig"`       // 翻译器总配置
+	ProxyConfig            *ProxyConfig            `toml:"ProxyConfig"`            // 代理配置
+	AnalyticsConfig        *AnalyticsConfig        `toml:"AnalyticsConfig"`        // 数据分析配置
+	BilibiliConfig         *BilibiliConfig         `toml:"BilibiliConfig"`         // Bilibili上传配置
+	WhisperConfig          *WhisperConfig          `toml:"WhisperConfig"`          // Whisper 语音识别配置
+	FirebaseConfig         *FirebaseConfig         `toml:"FirebaseConfig"`         // Firebase Backend配置
 }
 
 // BilibiliConfig Bilibili上传配置
@@ -103,6 +105,18 @@ type APIAuthConfig struct {
 	CookiesDecryptKey string `toml:"cookies_decrypt_key"` // Cookies 解密密钥
 }
 
+// TaskConfig 任务调度配置
+type TaskConfig struct {
+	MaxConcurrentPrepare int `toml:"max_concurrent_prepare"` // 准备阶段最大并发数（下载/转写/翻译/元数据）
+}
+
+// DownloadConfig 下载配置
+type DownloadConfig struct {
+	UseAria2  bool   `toml:"use_aria2"`  // yt-dlp 下载视频时是否调用 aria2c
+	Aria2Path string `toml:"aria2_path"` // aria2c 可执行文件路径，留空则从 PATH 查找
+	Aria2Args string `toml:"aria2_args"` // 传给 aria2c 的参数
+}
+
 // GetDSN 获取数据库连接字符串
 func (d Database) GetDSN() string {
 	switch d.Type {
@@ -140,7 +154,7 @@ type BaiduTransConfig struct {
 type DeepSeekTransConfig struct {
 	Enabled   bool   `toml:"enabled"`    // 是否启用翻译服务
 	ApiKey    string `toml:"api_key"`    // DeepSeek API密钥
-	Model     string `toml:"models"`     // 使用的模型，默认为 deepseek-chat
+	Model     string `toml:"model"`      // 使用的模型，默认为 deepseek-chat
 	Endpoint  string `toml:"endpoint"`   // API端点，默认为 https://api.deepseek.com
 	Timeout   int    `toml:"timeout"`    // 超时时间（秒）
 	MaxTokens int    `toml:"max_tokens"` // 最大token数
@@ -242,6 +256,14 @@ func NewDefaultConfig() *AppConfig {
 			AppSecret:         "1206091a-3c46-488b-9964-8bc230ee6437",
 			CookiesDecryptKey: "07c6b76c-41fa-437d-8730-09f5279bb9dc",
 		},
+		TaskConfig: TaskConfig{
+			MaxConcurrentPrepare: 2,
+		},
+		Download: DownloadConfig{
+			UseAria2:  false,
+			Aria2Path: "",
+			Aria2Args: "-x 16 -s 16 -k 1M --file-allocation=none",
+		},
 
 		// 首选AI服务提供商（空表示自动选择）
 		PrimaryAIService: "",
@@ -311,7 +333,7 @@ func NewDefaultConfig() *AppConfig {
 			UpCloseReply:       0,         // 默认开启评论
 			UpCloseReward:      0,         // 默认开启打赏
 		},
-	
+
 		// // OpenAI 兼容 API 配置（默认值，可被 config.toml 覆盖）
 		OpenAICompatibleConfig: &OpenAICompatibleConfig{
 			Enabled:     false,
@@ -347,6 +369,8 @@ func LoadConfig(configFile string) (*AppConfig, error) {
 		Database               Database                `toml:"database"`
 		Auth                   AuthConfig              `toml:"auth"`
 		APIAuth                APIAuthConfig           `toml:"api_auth"`
+		TaskConfig             TaskConfig              `toml:"task"`
+		Download               DownloadConfig          `toml:"download"`
 		FileUpDir              string                  `toml:"fileUpDir"`
 		DataPath               string                  `toml:"data_path"`
 		YtDlpPath              string                  `toml:"yt_dlp_path"`
@@ -367,6 +391,17 @@ func LoadConfig(configFile string) (*AppConfig, error) {
 		return nil, err
 	}
 
+	if fileConfig.DeepSeekTransConfig != nil && fileConfig.DeepSeekTransConfig.Model == "" {
+		var legacyConfig struct {
+			DeepSeekTransConfig struct {
+				Model string `toml:"models"`
+			} `toml:"DeepSeekTransConfig"`
+		}
+		if _, legacyErr := toml.DecodeFile(configFile, &legacyConfig); legacyErr == nil {
+			fileConfig.DeepSeekTransConfig.Model = legacyConfig.DeepSeekTransConfig.Model
+		}
+	}
+
 	// 只覆盖配置文件中存在的字段，保留硬编码的配置
 	config.Listen = fileConfig.Listen
 	config.Environment = fileConfig.Environment
@@ -377,12 +412,22 @@ func LoadConfig(configFile string) (*AppConfig, error) {
 	config.DataPath = fileConfig.DataPath
 	config.YtDlpPath = fileConfig.YtDlpPath
 	config.PrimaryAIService = fileConfig.PrimaryAIService
-	
+
 	// API 认证配置：如果配置了 AppID，则覆盖默认值
 	if fileConfig.APIAuth.AppID != "" {
 		config.APIAuth = fileConfig.APIAuth
 	}
-	
+	if fileConfig.TaskConfig.MaxConcurrentPrepare > 0 {
+		config.TaskConfig = fileConfig.TaskConfig
+	}
+	if fileConfig.Download.UseAria2 || fileConfig.Download.Aria2Path != "" || fileConfig.Download.Aria2Args != "" {
+		config.Download.UseAria2 = fileConfig.Download.UseAria2
+		config.Download.Aria2Path = fileConfig.Download.Aria2Path
+		if fileConfig.Download.Aria2Args != "" {
+			config.Download.Aria2Args = fileConfig.Download.Aria2Args
+		}
+	}
+
 	if fileConfig.TenCosConfig != nil {
 		config.TenCosConfig = fileConfig.TenCosConfig
 	}
@@ -408,7 +453,6 @@ func LoadConfig(configFile string) (*AppConfig, error) {
 		config.WhisperConfig = fileConfig.WhisperConfig
 	}
 
-
 	return config, nil
 }
 
@@ -422,6 +466,8 @@ func SaveConfig(config *AppConfig) error {
 		Database               Database                `toml:"database"`
 		Auth                   AuthConfig              `toml:"auth"`
 		APIAuth                APIAuthConfig           `toml:"api_auth"`
+		TaskConfig             TaskConfig              `toml:"task"`
+		Download               DownloadConfig          `toml:"download"`
 		FileUpDir              string                  `toml:"fileUpDir"`
 		DataPath               string                  `toml:"data_path"`
 		YtDlpPath              string                  `toml:"yt_dlp_path"`
@@ -441,6 +487,8 @@ func SaveConfig(config *AppConfig) error {
 		Database:               config.Database,
 		Auth:                   config.Auth,
 		APIAuth:                config.APIAuth,
+		TaskConfig:             config.TaskConfig,
+		Download:               config.Download,
 		FileUpDir:              config.FileUpDir,
 		DataPath:               config.DataPath,
 		YtDlpPath:              config.YtDlpPath,

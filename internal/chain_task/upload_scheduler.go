@@ -16,6 +16,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const autoUploadDelay = 10 * time.Minute
+
 // UploadScheduler 上传调度器
 // 负责定时上传视频和字幕到Bilibili
 type UploadScheduler struct {
@@ -52,43 +54,42 @@ func NewUploadScheduler(
 
 // SetUp 启动上传调度器
 func (s *UploadScheduler) SetUp() {
-	// 每5分钟检查一次是否需要上传
-	s.Task.AddFunc("*/5 * * * *", func() {
+	// 每分钟检查一次是否需要自动上传
+	s.Task.AddFunc("* * * * *", func() {
 		s.mutex.Lock()
 		defer s.mutex.Unlock()
 
-		now := time.Now()
-
-		// 1. 检查是否需要上传视频（每小时一次）
-		if now.Sub(s.lastVideoUploadTime) >= time.Hour {
-			s.logger.Info("🔍 检查待上传的视频...")
-			if err := s.uploadNextVideo(); err != nil {
-				s.logger.Errorf("上传视频失败: %v", err)
-			} else {
-				s.lastVideoUploadTime = now
-			}
+		// 1. 检查是否有准备好超过10分钟且未手动上传的视频
+		s.logger.Info("🔍 检查待自动上传的视频...")
+		if err := s.uploadNextVideo(); err != nil {
+			s.logger.Errorf("上传视频失败: %v", err)
+		} else {
+			s.lastVideoUploadTime = time.Now()
 		}
 
 		// 字幕上传改为手动触发（失败后由前端重试按钮触发）
 	})
 
-	s.logger.Info("✓ Upload scheduler started, checking every 5 minutes")
+	s.logger.Info("✓ Upload scheduler started, checking every minute")
 }
 
 // uploadNextVideo 上传下一个准备好的视频
 func (s *UploadScheduler) uploadNextVideo() error {
-	// 查询状态为 '200' (准备就绪) 的视频
+	// 查询状态为 '200' (准备就绪) 且保持10分钟未手动上传的视频
 	var videos []struct {
 		ID        uint
 		VideoID   string
 		Title     string
+		UpdatedAt time.Time
 		CreatedAt time.Time
 	}
 
+	autoUploadBefore := time.Now().Add(-autoUploadDelay)
+
 	err := s.Db.Table("cw_saved_videos").
-		Select("id, video_id, title, created_at").
-		Where("status = ?", "200").
-		Order("created_at ASC").
+		Select("id, video_id, title, updated_at, created_at").
+		Where("status = ? AND updated_at <= ?", "200", autoUploadBefore).
+		Order("updated_at ASC").
 		Limit(1).
 		Find(&videos).Error
 
@@ -97,7 +98,7 @@ func (s *UploadScheduler) uploadNextVideo() error {
 	}
 
 	if len(videos) == 0 {
-		s.logger.Debug("没有待上传的视频")
+		s.logger.Debug("没有待自动上传的视频")
 		return nil
 	}
 

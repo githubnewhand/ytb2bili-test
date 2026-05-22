@@ -17,3 +17,11 @@ debug = true
   jwt_secret = "your-jwt-secret-key"
   jwt_expiration = 24
   session_secret = "your-session-secret"
+
+[task]
+  max_concurrent_prepare = 2
+
+[download]
+  use_aria2 = false
+  aria2_path = ""
+  aria2_args = "-x 16 -s 16 -k 1M --file-allocation=none"

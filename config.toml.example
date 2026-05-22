@@ -30,6 +30,20 @@ FileUpDir = "/Users/apple/opt/file_upload/media"  # 文件上传目录（绝对�
   session_secret = "your-session-secret"  # Session 密钥（生产环境请修改）
 
 # ======================
+# 任务调度配置
+# ======================
+[task]
+  max_concurrent_prepare = 2  # 准备阶段最大并发数：下载/分离音频/转写/翻译/生成元数据
+
+# ======================
+# 下载配置
+# ======================
+[download]
+  use_aria2 = false
+  aria2_path = ""  # 留空则从 PATH 查找 aria2c
+  aria2_args = "-x 16 -s 16 -k 1M --file-allocation=none"
+
+# ======================
 # 腾讯云 COS 存储配置
 # ======================
 [TenCosConfig]

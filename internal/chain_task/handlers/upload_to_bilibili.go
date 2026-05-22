@@ -201,7 +201,7 @@ func (t *UploadToBilibili) Execute(context map[string]interface{}) bool {
 
 	// 5. Upload cover when available
 	coverURL := ""
-	if coverImagePath, ok := context["cover_image_path"].(string); ok && coverImagePath != "" {
+	if coverImagePath := t.resolveCoverImagePath(context); coverImagePath != "" {
 		t.App.Logger.Infof("📸 找到封面图片: %s", filepath.Base(coverImagePath))
 		types.ReportTaskProgress(context, 100, "上传封面")
 
@@ -323,6 +323,60 @@ func (t *UploadToBilibili) findVideoFiles() []string {
 	}
 
 	return videoFiles
+}
+
+func (t *UploadToBilibili) resolveCoverImagePath(context map[string]interface{}) string {
+	if coverImagePath, ok := context["cover_image_path"].(string); ok && t.isUsableFile(coverImagePath) {
+		return coverImagePath
+	}
+
+	for _, filename := range []string{
+		"maxresdefault.jpg",
+		"sddefault.jpg",
+		"hqdefault.jpg",
+		"mqdefault.jpg",
+		"default.jpg",
+		"cover.jpg",
+	} {
+		coverImagePath := filepath.Join(t.StateManager.CurrentDir, filename)
+		if t.isUsableFile(coverImagePath) {
+			context["cover_image_path"] = coverImagePath
+			t.App.Logger.Infof("✓ 使用已下载的 YouTube 封面: %s", coverImagePath)
+			return coverImagePath
+		}
+	}
+
+	t.App.Logger.Info("未找到本地 YouTube 封面，尝试下载最佳可用封面")
+	result := utils.DownloadYouTubeThumbnail(t.StateManager.VideoID, "best", utils.DownloadOptions{
+		SavePath:         t.StateManager.CurrentDir,
+		FilenameTemplate: "{quality}",
+		Timeout:          10 * time.Second,
+		MaxRetries:       3,
+		QualityFallback:  true,
+		CreateDirs:       true,
+		Overwrite:        false,
+	}, "")
+
+	if downloadResult, ok := result.(utils.DownloadResult); ok && downloadResult.Success && t.isUsableFile(downloadResult.FilePath) {
+		context["cover_image_path"] = downloadResult.FilePath
+		t.App.Logger.Infof("✓ 已下载 YouTube 封面用于投稿: %s", downloadResult.FilePath)
+		return downloadResult.FilePath
+	}
+
+	if downloadResult, ok := result.(utils.DownloadResult); ok && downloadResult.ErrorMessage != "" {
+		t.App.Logger.Warnf("⚠️ 下载 YouTube 封面失败，将使用 B站默认封面: %s", downloadResult.ErrorMessage)
+	} else {
+		t.App.Logger.Warn("⚠️ 下载 YouTube 封面失败，将使用 B站默认封面")
+	}
+	return ""
+}
+
+func (t *UploadToBilibili) isUsableFile(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Size() > 0
 }
 
 // buildStudioInfo 构建投稿信息

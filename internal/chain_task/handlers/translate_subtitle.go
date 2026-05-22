@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/difyz9/ytb2bili/internal/chain_task/base"
 	"github.com/difyz9/ytb2bili/internal/chain_task/manager"
@@ -18,11 +19,12 @@ import (
 
 type TranslateSubtitle struct {
 	base.BaseTask
-	App        *core.AppServer
-	DB         *gorm.DB
-	APIKey     string
-	GroupSize  int
-	MaxWorkers int // 最大并发数
+	App         *core.AppServer
+	DB          *gorm.DB
+	APIKey      string
+	GroupSize   int
+	MaxWorkers  int // 最大并发数
+	RateLimiter *adaptiveRateLimiter
 }
 
 func NewTranslateSubtitle(name string, app *core.AppServer, stateManager *manager.StateManager, client *cos.CosClient, db *gorm.DB, apiKey string) *TranslateSubtitle {
@@ -35,8 +37,8 @@ func NewTranslateSubtitle(name string, app *core.AppServer, stateManager *manage
 		App:        app,
 		DB:         db,
 		APIKey:     "", // 不再固化API Key，运行时动态获取
-		GroupSize:  25, // 每组25句，减少API调用次数
-		MaxWorkers: 3,  // 最多3个并发，避免API限制
+		GroupSize:  15, // 每组15句，降低单次请求长度
+		MaxWorkers: 5,  // worker可以较高，真实请求节奏由自适应限速器控制
 	}
 }
 
@@ -61,6 +63,98 @@ type SRTEntry struct {
 	Text     string
 }
 
+type adaptiveRateLimiter struct {
+	mu            sync.Mutex
+	interval      time.Duration
+	minInterval   time.Duration
+	maxInterval   time.Duration
+	nextAllowed   time.Time
+	successStreak int
+}
+
+func newAdaptiveRateLimiter(initial, minInterval, maxInterval time.Duration) *adaptiveRateLimiter {
+	return &adaptiveRateLimiter{
+		interval:    initial,
+		minInterval: minInterval,
+		maxInterval: maxInterval,
+	}
+}
+
+func (l *adaptiveRateLimiter) Wait() {
+	if l == nil {
+		return
+	}
+
+	l.mu.Lock()
+	now := time.Now()
+	if l.nextAllowed.Before(now) {
+		l.nextAllowed = now
+	}
+	wait := l.nextAllowed.Sub(now)
+	l.nextAllowed = l.nextAllowed.Add(l.interval)
+	l.mu.Unlock()
+
+	if wait > 0 {
+		time.Sleep(wait)
+	}
+}
+
+func (l *adaptiveRateLimiter) ReportSuccess() time.Duration {
+	if l == nil {
+		return 0
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.successStreak++
+	if l.successStreak >= 8 && l.interval > l.minInterval {
+		l.interval = l.interval * 85 / 100
+		if l.interval < l.minInterval {
+			l.interval = l.minInterval
+		}
+		l.successStreak = 0
+	}
+
+	return l.interval
+}
+
+func (l *adaptiveRateLimiter) ReportFailure(err error) time.Duration {
+	if l == nil || err == nil {
+		return 0
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	errorStr := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(errorStr, "429") || strings.Contains(errorStr, "rate limit"):
+		l.interval *= 2
+	case strings.Contains(errorStr, "timeout") ||
+		strings.Contains(errorStr, "deadline exceeded") ||
+		strings.Contains(errorStr, "connection") ||
+		strings.Contains(errorStr, "500") ||
+		strings.Contains(errorStr, "502") ||
+		strings.Contains(errorStr, "503") ||
+		strings.Contains(errorStr, "504"):
+		l.interval = l.interval * 140 / 100
+	default:
+		return l.interval
+	}
+
+	if l.interval > l.maxInterval {
+		l.interval = l.maxInterval
+	}
+	l.successStreak = 0
+
+	if l.nextAllowed.Before(time.Now().Add(l.interval)) {
+		l.nextAllowed = time.Now().Add(l.interval)
+	}
+
+	return l.interval
+}
+
 func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 	t.App.Logger.Info("========================================")
 	t.App.Logger.Infof("开始翻译字幕: VideoID=%s", t.StateManager.VideoID)
@@ -78,6 +172,7 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 	t.App.Logger.Infof("🔑 使用DeepSeek API Key: %s", maskAPIKey(currentAPIKey))
 	// 更新当前使用的API Key
 	t.APIKey = currentAPIKey
+	t.RateLimiter = newAdaptiveRateLimiter(800*time.Millisecond, 350*time.Millisecond, 6*time.Second)
 	types.ReportTaskProgress(context, 10, "读取字幕文件")
 
 	// 1. 检查英文字幕文件是否存在（由 GenerateSubtitles 任务生成）
@@ -119,8 +214,8 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 	}
 
 	// 4. 执行并发翻译
-	totalGroups := (len(texts) + t.GroupSize - 1) / t.GroupSize
-	t.App.Logger.Infof("� 开始并发翻译，每组 %d 句，共 %d 组，并发数: %d", t.GroupSize, totalGroups, t.MaxWorkers)
+	totalGroups := len(t.buildTranslationGroups(texts))
+	t.App.Logger.Infof("🚀 开始并发翻译，每组最多 %d 句，共 %d 组，并发数: %d", t.GroupSize, totalGroups, t.MaxWorkers)
 
 	translatedTexts, err := t.translateTextsInGroupsConcurrent(texts, context)
 	if err != nil {
@@ -252,7 +347,8 @@ func (t *TranslateSubtitle) generateTranslatedSRTContent(entries []SRTEntry, tra
 
 // translateTextsInGroupsConcurrent 并发分组翻译文本
 func (t *TranslateSubtitle) translateTextsInGroupsConcurrent(texts []string, context map[string]interface{}) ([]string, error) {
-	totalGroups := (len(texts) + t.GroupSize - 1) / t.GroupSize
+	groups := t.buildTranslationGroups(texts)
+	totalGroups := len(groups)
 	results := make([][]string, totalGroups)
 	if totalGroups == 0 {
 		return []string{}, nil
@@ -289,8 +385,8 @@ func (t *TranslateSubtitle) translateTextsInGroupsConcurrent(texts []string, con
 				t.App.Logger.Infof("⏳ 工作者 %d 处理第 %d/%d 组 (%d句)",
 					workerID, task.groupIndex+1, totalGroups, len(task.texts))
 
-				// 使用简化的翻译方法
-				translated, err := t.translateGroupSimple(task.texts)
+				// 优先批量翻译；失败时自动拆小组，避免单组失败拖垮整条任务链。
+				translated, err := t.translateGroupResilient(task.texts)
 
 				resultChannel <- struct {
 					groupIndex int
@@ -307,15 +403,10 @@ func (t *TranslateSubtitle) translateTextsInGroupsConcurrent(texts []string, con
 
 	// 分发任务
 	go func() {
-		for i := 0; i < len(texts); i += t.GroupSize {
-			end := i + t.GroupSize
-			if end > len(texts) {
-				end = len(texts)
-			}
-
+		for i, groupTexts := range groups {
 			taskChannel <- translateTask{
-				groupIndex: i / t.GroupSize,
-				texts:      texts[i:end],
+				groupIndex: i,
+				texts:      groupTexts,
 			}
 		}
 		close(taskChannel)
@@ -328,13 +419,18 @@ func (t *TranslateSubtitle) translateTextsInGroupsConcurrent(texts []string, con
 	}()
 
 	// 处理结果
-	var lastErr error
 	completedGroups := 0
+	failedGroups := 0
+	var fatalErr error
 	for result := range resultChannel {
 		if result.err != nil {
-			t.App.Logger.Errorf("❌ 第 %d 组翻译失败: %v", result.groupIndex+1, result.err)
-			lastErr = result.err
-			continue
+			if len(result.result) == 0 {
+				fatalErr = result.err
+				t.App.Logger.Errorf("❌ 第 %d 组翻译失败: %v", result.groupIndex+1, result.err)
+				continue
+			}
+			t.App.Logger.Warnf("⚠️  第 %d 组翻译降级完成: %v", result.groupIndex+1, result.err)
+			failedGroups++
 		}
 		results[result.groupIndex] = result.result
 		completedGroups++
@@ -345,17 +441,130 @@ func (t *TranslateSubtitle) translateTextsInGroupsConcurrent(texts []string, con
 		types.ReportTaskProgress(context, progress, fmt.Sprintf("已翻译 %d/%d 组", completedGroups, totalGroups))
 	}
 
-	if lastErr != nil {
-		return nil, lastErr
+	if fatalErr != nil {
+		return nil, fatalErr
 	}
 
 	// 合并结果
 	var allTranslated []string
-	for _, groupResult := range results {
+	for i, groupResult := range results {
+		if len(groupResult) == 0 {
+			return nil, fmt.Errorf("第 %d 组翻译没有结果", i+1)
+		}
 		allTranslated = append(allTranslated, groupResult...)
 	}
 
+	if failedGroups > 0 {
+		t.App.Logger.Warnf("⚠️  有 %d 组触发降级翻译，字幕文件已尽量保留完整", failedGroups)
+	}
+
 	return allTranslated, nil
+}
+
+// buildTranslationGroups 按句数和字符数切分字幕，避免单次请求过长。
+func (t *TranslateSubtitle) buildTranslationGroups(texts []string) [][]string {
+	const maxGroupChars = 3000
+
+	var groups [][]string
+	var current []string
+	currentChars := 0
+
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		group := make([]string, len(current))
+		copy(group, current)
+		groups = append(groups, group)
+		current = nil
+		currentChars = 0
+	}
+
+	groupSize := t.GroupSize
+	if groupSize <= 0 {
+		groupSize = 15
+	}
+
+	for _, text := range texts {
+		textChars := len([]rune(text))
+		if len(current) > 0 && (len(current) >= groupSize || currentChars+textChars > maxGroupChars) {
+			flush()
+		}
+		current = append(current, text)
+		currentChars += textChars
+	}
+	flush()
+
+	return groups
+}
+
+// translateGroupResilient 批量失败后自动拆小组，最后逐条兜底，尽量产出完整字幕。
+func (t *TranslateSubtitle) translateGroupResilient(texts []string) ([]string, error) {
+	translated, err := t.translateGroupSimple(texts)
+	if err == nil {
+		return translated, nil
+	}
+
+	if t.isFatalTranslationError(err) {
+		return nil, err
+	}
+
+	t.App.Logger.Warnf("⚠️  批量翻译失败，准备降级处理 (%d句): %v", len(texts), err)
+	if len(texts) == 1 {
+		return []string{fmt.Sprintf("[翻译失败] %s", texts[0])}, err
+	}
+
+	const fallbackGroupSize = 5
+	if len(texts) > fallbackGroupSize {
+		var allTranslated []string
+		var lastErr error
+		for i := 0; i < len(texts); i += fallbackGroupSize {
+			end := i + fallbackGroupSize
+			if end > len(texts) {
+				end = len(texts)
+			}
+			partTranslated, partErr := t.translateGroupResilient(texts[i:end])
+			if partErr != nil {
+				lastErr = partErr
+			}
+			allTranslated = append(allTranslated, partTranslated...)
+		}
+		return allTranslated, lastErr
+	}
+
+	var allTranslated []string
+	var lastErr error
+	for _, text := range texts {
+		itemTranslated, itemErr := t.translateGroupResilient([]string{text})
+		if itemErr != nil {
+			lastErr = itemErr
+		}
+		allTranslated = append(allTranslated, itemTranslated...)
+	}
+
+	return allTranslated, lastErr
+}
+
+func (t *TranslateSubtitle) isFatalTranslationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errorStr := strings.ToLower(err.Error())
+	fatalMarkers := []string{
+		"api key",
+		"未配置",
+		"unauthorized",
+		"401",
+		"403",
+		"insufficient_quota",
+		"quota",
+	}
+	for _, marker := range fatalMarkers {
+		if strings.Contains(errorStr, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 // translateGroupSimple 简化的组翻译（无上下文，更快速）
@@ -552,11 +761,22 @@ func (t *TranslateSubtitle) callDeepSeekAPI(systemPrompt, userPrompt string) (st
 	// 添加调试日志，显示当前使用的API Key（用于验证热更新是否生效）
 	t.App.Logger.Debugf("🔑 当前使用API Key: %s", maskAPIKey(currentAPIKey))
 
+	if t.RateLimiter == nil {
+		t.RateLimiter = newAdaptiveRateLimiter(800*time.Millisecond, 350*time.Millisecond, 6*time.Second)
+	}
+	t.RateLimiter.Wait()
+
 	client := NewDeepSeekClientWithConfig(currentAPIKey, t.App.Config)
 	response, err := client.ChatCompletion(systemPrompt, userPrompt)
 	if err != nil {
+		interval := t.RateLimiter.ReportFailure(err)
+		if interval > 0 {
+			t.App.Logger.Warnf("⚠️  DeepSeek请求失败，限速间隔调整为 %v: %v", interval, err)
+		}
 		return "", fmt.Errorf("调用DeepSeek API失败: %v", err)
 	}
+	interval := t.RateLimiter.ReportSuccess()
+	t.App.Logger.Debugf("✅ DeepSeek请求成功，当前限速间隔: %v", interval)
 
 	return response, nil
 }

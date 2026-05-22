@@ -28,10 +28,10 @@ type ChainTaskHandler struct {
 	SavedVideoService *services.SavedVideoService
 	TaskStepService   *services.TaskStepService
 
-	isRunning bool
-	Task      *cron.Cron
-	Db        *gorm.DB
-	mutex     sync.Mutex
+	Task          *cron.Cron
+	Db            *gorm.DB
+	mutex         sync.Mutex
+	runningVideos map[string]struct{}
 }
 
 func NewChainTaskHandler(app *core.AppServer, task *cron.Cron, db *gorm.DB, savedVideoService *services.SavedVideoService, taskStepService *services.TaskStepService) *ChainTaskHandler {
@@ -42,7 +42,7 @@ func NewChainTaskHandler(app *core.AppServer, task *cron.Cron, db *gorm.DB, save
 		SavedVideoService: savedVideoService,
 		TaskStepService:   taskStepService,
 		mutex:             sync.Mutex{},
-		isRunning:         false,
+		runningVideos:     make(map[string]struct{}),
 	}
 }
 
@@ -57,8 +57,10 @@ func (h *ChainTaskHandler) SetUp() {
 		h.mutex.Lock()
 		defer h.mutex.Unlock()
 
-		if h.isRunning {
-			h.App.Logger.Debug("当前有任务正在执行，跳过本次请求")
+		maxConcurrent := h.maxConcurrentPrepare()
+		availableSlots := maxConcurrent - len(h.runningVideos)
+		if availableSlots <= 0 {
+			h.App.Logger.Debugf("准备阶段并发已满 (%d/%d)，跳过本次调度", len(h.runningVideos), maxConcurrent)
 			return
 		}
 
@@ -68,23 +70,29 @@ func (h *ChainTaskHandler) SetUp() {
 			h.App.Logger.Errorf("查询重试步骤失败: %v", err)
 		} else if len(retrySteps) > 0 {
 			h.App.Logger.Infof("发现 %d 个待重试的步骤", len(retrySteps))
-			h.isRunning = true
 
-			// 执行重试步骤
 			for _, step := range retrySteps {
-				h.App.Logger.Infof("🔄 开始重试步骤: %s - %s", step.VideoID, step.StepName)
-				if err := h.RunSingleTaskStep(step.VideoID, step.StepName); err != nil {
-					h.App.Logger.Errorf("重试步骤失败: %v", err)
+				if availableSlots <= 0 {
+					return
 				}
+				if h.isVideoRunningLocked(step.VideoID) {
+					continue
+				}
+				h.markVideoRunningLocked(step.VideoID)
+				availableSlots--
+
+				go h.runRetryStep(step.VideoID, step.StepName)
+				break
 			}
 
-			h.isRunning = false
-			return
+			if availableSlots <= 0 {
+				return
+			}
 		}
 
 		// 2. 处理新的视频任务
 		// 查询状态为 '001' 的任务
-		pendingTasks, err := h.getPendingTasks()
+		pendingTasks, err := h.getPendingTasks(availableSlots)
 		if err != nil {
 			h.App.Logger.Errorf("查询待处理任务失败: %v", err)
 			return
@@ -99,24 +107,30 @@ func (h *ChainTaskHandler) SetUp() {
 
 		// 001 (待处理) → 002 (处理中) → 100 (完成) 或 999 (失败)
 
-		// 执行第一个待处理任务
-		task := pendingTasks[0]
-		h.App.Logger.Infof("找到待处理任务，VideoId: %s", task.VideoId)
+		for _, task := range pendingTasks {
+			if availableSlots <= 0 {
+				return
+			}
+			if h.isVideoRunningLocked(task.VideoId) {
+				continue
+			}
 
-		// 更新任务状态为处理中
-		if err := h.updateSavedVideoStatus(task.Id, "002"); err != nil {
-			h.App.Logger.Errorf("更新任务状态为处理中时出错: %v", err)
-			return
+			claimed, err := h.SavedVideoService.TryUpdateStatus(task.Id, "001", "002")
+			if err != nil {
+				h.App.Logger.Errorf("更新任务状态为处理中时出错: %v", err)
+				continue
+			}
+			if !claimed {
+				h.App.Logger.Debugf("任务 %s 状态已变化，跳过本次调度", task.VideoId)
+				continue
+			}
+
+			h.markVideoRunningLocked(task.VideoId)
+			availableSlots--
+
+			h.App.Logger.Infof("找到待处理任务，VideoId: %s", task.VideoId)
+			go h.runTaskChainAsync(*task)
 		}
-
-		h.isRunning = true
-		h.App.Logger.Debug("开始执行任务链")
-
-		// 执行任务链
-		h.RunTaskChain(*task)
-
-		h.isRunning = false
-		h.App.Logger.Debug("任务链执行完成")
 	})
 
 	// 启动 cron 调度器
@@ -139,9 +153,12 @@ func (h *ChainTaskHandler) resetRunningTasksOnStartup() {
 }
 
 // getPendingTasks 获取状态为 '001' 的待处理任务（从 SavedVideo 表查询）
-func (h *ChainTaskHandler) getPendingTasks() ([]*models2.TbVideo, error) {
+func (h *ChainTaskHandler) getPendingTasks(limit int) ([]*models2.TbVideo, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
 	// 使用 SavedVideoService 查询状态为 '001' 的任务
-	savedVideos, err := h.SavedVideoService.GetPendingVideos(10)
+	savedVideos, err := h.SavedVideoService.GetPendingVideos(limit)
 	if err != nil {
 		return nil, err
 	}
@@ -162,6 +179,45 @@ func (h *ChainTaskHandler) getPendingTasks() ([]*models2.TbVideo, error) {
 	}
 
 	return tasks, nil
+}
+
+func (h *ChainTaskHandler) maxConcurrentPrepare() int {
+	if h.App != nil && h.App.Config.TaskConfig.MaxConcurrentPrepare > 0 {
+		return h.App.Config.TaskConfig.MaxConcurrentPrepare
+	}
+	return 1
+}
+
+func (h *ChainTaskHandler) isVideoRunningLocked(videoID string) bool {
+	_, exists := h.runningVideos[videoID]
+	return exists
+}
+
+func (h *ChainTaskHandler) markVideoRunningLocked(videoID string) {
+	h.runningVideos[videoID] = struct{}{}
+}
+
+func (h *ChainTaskHandler) unmarkVideoRunning(videoID string) {
+	h.mutex.Lock()
+	delete(h.runningVideos, videoID)
+	h.mutex.Unlock()
+}
+
+func (h *ChainTaskHandler) runRetryStep(videoID, stepName string) {
+	defer h.unmarkVideoRunning(videoID)
+
+	h.App.Logger.Infof("🔄 开始重试步骤: %s - %s", videoID, stepName)
+	if err := h.RunSingleTaskStep(videoID, stepName); err != nil {
+		h.App.Logger.Errorf("重试步骤失败: %v", err)
+	}
+}
+
+func (h *ChainTaskHandler) runTaskChainAsync(task models2.TbVideo) {
+	defer h.unmarkVideoRunning(task.VideoId)
+
+	h.App.Logger.Debugf("开始执行任务链: %s", task.VideoId)
+	h.RunTaskChain(task)
+	h.App.Logger.Debugf("任务链执行完成: %s", task.VideoId)
 }
 
 // getRetrySteps 获取状态为 'pending' 的重试步骤

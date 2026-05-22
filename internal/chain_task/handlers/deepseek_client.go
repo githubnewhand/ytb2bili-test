@@ -124,7 +124,7 @@ func (c *DeepSeekClient) ChatCompletion(systemPrompt, userPrompt string) (string
 
 	for attempt := 0; attempt <= c.MaxRetries; attempt++ {
 		if attempt > 0 {
-			time.Sleep(c.RetryDelay * time.Duration(attempt))
+			time.Sleep(c.retryDelayForError(lastErr, attempt))
 		}
 
 		result, err := c.doRequest(systemPrompt, userPrompt)
@@ -134,13 +134,79 @@ func (c *DeepSeekClient) ChatCompletion(systemPrompt, userPrompt string) (string
 
 		lastErr = err
 
-		// 如果是API限制错误，延长等待时间
-		if strings.Contains(err.Error(), "rate limit") || strings.Contains(err.Error(), "429") {
-			time.Sleep(time.Duration(attempt+1) * 5 * time.Second)
+		if !c.shouldRetry(err) {
+			return "", err
 		}
 	}
 
 	return "", fmt.Errorf("重试 %d 次后仍然失败: %v", c.MaxRetries, lastErr)
+}
+
+func (c *DeepSeekClient) shouldRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	errorStr := strings.ToLower(err.Error())
+
+	nonRetryableMarkers := []string{
+		"401",
+		"403",
+		"unauthorized",
+		"forbidden",
+		"invalid_api_key",
+		"insufficient_quota",
+		"quota",
+		"context_length_exceeded",
+		"invalid_request",
+		"max_tokens",
+	}
+	for _, marker := range nonRetryableMarkers {
+		if strings.Contains(errorStr, marker) {
+			return false
+		}
+	}
+
+	retryableMarkers := []string{
+		"429",
+		"rate limit",
+		"500",
+		"502",
+		"503",
+		"504",
+		"timeout",
+		"deadline exceeded",
+		"connection",
+		"connection reset",
+		"temporary",
+	}
+	for _, marker := range retryableMarkers {
+		if strings.Contains(errorStr, marker) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *DeepSeekClient) retryDelayForError(err error, attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	errorStr := ""
+	if err != nil {
+		errorStr = strings.ToLower(err.Error())
+	}
+
+	if strings.Contains(errorStr, "429") || strings.Contains(errorStr, "rate limit") {
+		return time.Duration(attempt*attempt) * 10 * time.Second
+	}
+
+	delay := c.RetryDelay * time.Duration(1<<(attempt-1))
+	maxDelay := 30 * time.Second
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
 }
 
 // doRequest 执行单次API请求
