@@ -1,6 +1,7 @@
 package chain_task
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/difyz9/ytb2bili/internal/core/services"
 	"github.com/difyz9/ytb2bili/internal/core/types"
 	"github.com/difyz9/ytb2bili/pkg/store/model"
+	"github.com/difyz9/ytb2bili/pkg/utils"
 
 	"sync"
 
@@ -25,8 +27,9 @@ import (
 type ChainTaskHandler struct {
 	App *core.AppServer
 
-	SavedVideoService *services.SavedVideoService
-	TaskStepService   *services.TaskStepService
+	SavedVideoService        *services.SavedVideoService
+	TaskStepService          *services.TaskStepService
+	ChargeCompilationService *services.ChargeCompilationService
 
 	Task          *cron.Cron
 	Db            *gorm.DB
@@ -34,15 +37,16 @@ type ChainTaskHandler struct {
 	runningVideos map[string]struct{}
 }
 
-func NewChainTaskHandler(app *core.AppServer, task *cron.Cron, db *gorm.DB, savedVideoService *services.SavedVideoService, taskStepService *services.TaskStepService) *ChainTaskHandler {
+func NewChainTaskHandler(app *core.AppServer, task *cron.Cron, db *gorm.DB, savedVideoService *services.SavedVideoService, taskStepService *services.TaskStepService, chargeCompilationService *services.ChargeCompilationService) *ChainTaskHandler {
 	return &ChainTaskHandler{
-		App:               app,
-		Task:              task,
-		Db:                db,
-		SavedVideoService: savedVideoService,
-		TaskStepService:   taskStepService,
-		mutex:             sync.Mutex{},
-		runningVideos:     make(map[string]struct{}),
+		App:                      app,
+		Task:                     task,
+		Db:                       db,
+		SavedVideoService:        savedVideoService,
+		TaskStepService:          taskStepService,
+		ChargeCompilationService: chargeCompilationService,
+		mutex:                    sync.Mutex{},
+		runningVideos:            make(map[string]struct{}),
 	}
 }
 
@@ -52,6 +56,11 @@ func (h *ChainTaskHandler) SetUp() {
 	h.resetRunningTasksOnStartup()
 
 	// 添加定时任务
+	h.reconcileCompletedChargeDownloads()
+	if _, err := h.Task.AddFunc("15 * * * * *", h.reconcileCompletedChargeDownloads); err != nil {
+		h.App.Logger.Errorf("register charge download reconciliation: %v", err)
+	}
+
 	h.Task.AddFunc("*/5 * * * * *", func() {
 
 		h.mutex.Lock()
@@ -115,7 +124,7 @@ func (h *ChainTaskHandler) SetUp() {
 				continue
 			}
 
-			claimed, err := h.SavedVideoService.TryUpdateStatus(task.Id, "001", "002")
+			claimed, err := h.SavedVideoService.TryUpdateStatus(task.Id, task.Status, "002")
 			if err != nil {
 				h.App.Logger.Errorf("更新任务状态为处理中时出错: %v", err)
 				continue
@@ -152,7 +161,27 @@ func (h *ChainTaskHandler) resetRunningTasksOnStartup() {
 	h.App.Logger.Info("✅ 已重置所有运行中的任务步骤，它们将在下次调度时重新执行")
 }
 
-// getPendingTasks 获取状态为 '001' 的待处理任务（从 SavedVideo 表查询）
+// reconcileCompletedChargeDownloads repairs completed charge downloads that missed pool routing.
+func (h *ChainTaskHandler) reconcileCompletedChargeDownloads() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	result, err := h.ChargeCompilationService.ReconcileCompletedChargeDownloads(ctx)
+	if err != nil {
+		h.App.Logger.Errorf("reconcile completed charge downloads: %v", err)
+		return
+	}
+	if result.Scanned > 0 || len(result.Problems) > 0 {
+		h.App.Logger.Infof(
+			"charge download reconciliation scanned=%d repaired=%d problems=%v",
+			result.Scanned,
+			result.Repaired,
+			result.Problems,
+		)
+	}
+}
+
+// getPendingTasks returns pending status-001 videos.
 func (h *ChainTaskHandler) getPendingTasks(limit int) ([]*models2.TbVideo, error) {
 	if limit <= 0 {
 		return nil, nil
@@ -225,97 +254,124 @@ func (h *ChainTaskHandler) getRetrySteps() ([]*model.TaskStep, error) {
 	return h.TaskStepService.GetPendingSteps()
 }
 func (h *ChainTaskHandler) RunTaskChain(video models2.TbVideo) {
-
 	currentDir, err := filepath.Abs(h.App.Config.FileUpDir)
 	if err != nil {
 		h.App.Logger.Errorf("获取文件上传目录失败: %v", err)
-		// 任务失败，更新状态为失败
-		if updateErr := h.SavedVideoService.UpdateStatus(video.Id, "999"); updateErr != nil {
-			h.App.Logger.Errorf("更新任务状态为失败时出错: %v", updateErr)
-		}
+		_ = h.SavedVideoService.UpdateStatus(video.Id, "999")
 		return
-
-	}
-
-	// 初始化任务步骤
-	if err := h.TaskStepService.InitTaskSteps(video.VideoId); err != nil {
-		h.App.Logger.Errorf("初始化任务步骤失败: %v", err)
 	}
 
 	stateManager := manager.NewStateManager(video.Id, video.VideoId, currentDir, video.CreatedAt)
+	if video.Status != "101" {
+		if err := h.TaskStepService.InitTaskPlan(video.VideoId, []string{"下载视频"}); err != nil {
+			h.App.Logger.Errorf("初始化下载步骤失败: %v", err)
+		}
+		downloadChain := manager.NewTaskChain()
+		downloadTask := handlers.NewDownloadVideo("下载视频", h.App, stateManager, h.App.CosClient, h.SavedVideoService)
+		downloadChain.AddTask(h.wrapTaskWithStepTracking(downloadTask, video.VideoId))
+		h.App.Logger.Info("开始执行下载阶段")
+		downloadResult := downloadChain.Run(true)
+		if errorValue, exists := downloadResult["error"]; exists && errorValue != nil {
+			h.App.Logger.Errorf("下载阶段失败: %v", errorValue)
+			_ = h.updateSavedVideoStatus(video.Id, "999")
+			return
+		}
+		downloadedFile, ok := downloadResult["downloaded_file"].(string)
+		if !ok || downloadedFile == "" {
+			h.App.Logger.Error("下载步骤未返回有效媒体路径")
+			_ = h.updateSavedVideoStatus(video.Id, "999")
+			return
+		}
+		probeContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		probe, probeErr := utils.ProbeMediaFile(probeContext, downloadedFile)
+		cancel()
+		if probeErr != nil {
+			h.App.Logger.Errorf("下载媒体检测失败: %v", probeErr)
+			_ = h.updateSavedVideoStatus(video.Id, "999")
+			return
+		}
+		route, routeErr := h.ChargeCompilationService.RouteDownloadedVideo(
+			video.VideoId,
+			downloadedFile,
+			probe.DurationMS,
+			probe.RawJSON,
+		)
+		if routeErr != nil {
+			h.App.Logger.Errorf("下载后分流失败: %v", routeErr)
+			_ = h.updateSavedVideoStatus(video.Id, "999")
+			return
+		}
+		if route != "free" {
+			h.App.Logger.Infof("视频下载完成并进入分流状态: %s", route)
+			return
+		}
+		stateManager.InputVideoPath = downloadedFile
+	} else {
+		savedVideo, getErr := h.SavedVideoService.GetVideoByVideoID(video.VideoId)
+		if getErr != nil || savedVideo.MediaPath == "" {
+			h.App.Logger.Errorf("恢复免费处理队列失败，媒体路径不可用: %v", getErr)
+			_ = h.updateSavedVideoStatus(video.Id, "999")
+			return
+		}
+		stateManager.InputVideoPath = savedVideo.MediaPath
+	}
+
+	stepNames := []string{"分离音频"}
+	if h.App.Config.WhisperConfig != nil && h.App.Config.WhisperConfig.Enabled {
+		stepNames = append(stepNames, "B站必剪转录")
+	} else {
+		stepNames = append(stepNames, "生成字幕")
+	}
+	stepNames = append(stepNames, "下载封面", "翻译字幕", "生成元数据", "上传到Bilibili", "上传字幕到Bilibili")
+	if err := h.TaskStepService.InitTaskPlan(video.VideoId, stepNames); err != nil {
+		h.App.Logger.Errorf("初始化免费处理步骤失败: %v", err)
+	}
+
 	chain := manager.NewTaskChain()
-
-	//// 任务1: 下载视频
-	downloadTask := handlers.NewDownloadVideo("下载视频", h.App, stateManager, h.App.CosClient, h.SavedVideoService)
-	chain.AddTask(h.wrapTaskWithStepTracking(downloadTask, video.VideoId))
-
-	// 任务2: 生成字幕文件
 	extractAudioTask := handlers.NewExtractAudio("分离音频", h.App, stateManager, h.App.CosClient)
 	chain.AddTask(h.wrapTaskWithStepTracking(extractAudioTask, video.VideoId))
-
-	// 任务3: 使用 B站必剪 转录生成字幕（如果启用）
 	if h.App.Config.WhisperConfig != nil && h.App.Config.WhisperConfig.Enabled {
-		h.App.Logger.Info("✓ B站必剪 已启用，将使用 B站必剪 进行语音转录")
-		whisperTask := handlers.NewBcutHandler(
+		chain.AddTask(h.wrapTaskWithStepTracking(handlers.NewBcutHandler(
 			"B站必剪转录",
 			h.App,
 			stateManager,
 			h.App.CosClient,
 			h.App.Config.WhisperConfig.Language,
-		)
-		chain.AddTask(h.wrapTaskWithStepTracking(whisperTask, video.VideoId))
+		), video.VideoId))
 	} else {
-		// 备用方案：使用原有的字幕生成方法
-		h.App.Logger.Info("使用默认字幕生成方法")
-		subtitleTask := handlers.NewGenerateSubtitles("生成字幕", h.App, stateManager, h.App.CosClient, h.SavedVideoService)
-		chain.AddTask(h.wrapTaskWithStepTracking(subtitleTask, video.VideoId))
+		chain.AddTask(h.wrapTaskWithStepTracking(
+			handlers.NewGenerateSubtitles("生成字幕", h.App, stateManager, h.App.CosClient, h.SavedVideoService),
+			video.VideoId,
+		))
 	}
-	chain.AddTask(handlers.NewDownloadImgHandler("下载封面", h.App, stateManager, h.App.CosClient))
-	// 任务3: 翻译字幕（动态检查配置）
-	translateTask := handlers.NewTranslateSubtitle("翻译字幕", h.App, stateManager, h.App.CosClient, h.Db, "")
-	chain.AddTask(h.wrapTaskWithStepTracking(translateTask, video.VideoId))
+	chain.AddTask(h.wrapTaskWithStepTracking(
+		handlers.NewDownloadImgHandler("下载封面", h.App, stateManager, h.App.CosClient),
+		video.VideoId,
+	))
+	chain.AddTask(h.wrapTaskWithStepTracking(
+		handlers.NewTranslateSubtitle("翻译字幕", h.App, stateManager, h.App.CosClient, h.Db, ""),
+		video.VideoId,
+	))
+	chain.AddTask(h.wrapTaskWithStepTracking(
+		handlers.NewGenerateMetadata("生成元数据", h.App, stateManager, h.App.CosClient, "", h.Db, h.SavedVideoService),
+		video.VideoId,
+	))
 
-	// 任务4: 生成视频标题和描述（动态检查配置）
-	metadataTask := handlers.NewGenerateMetadata("生成元数据", h.App, stateManager, h.App.CosClient, "", h.Db, h.SavedVideoService)
-	chain.AddTask(h.wrapTaskWithStepTracking(metadataTask, video.VideoId))
-
-	// 注意: 上传任务已移至 UploadScheduler 定时执行
-	// - 视频上传: 每小时上传一个视频
-	// - 字幕上传: 视频上传后1小时再上传字幕
-
-	h.App.Logger.Info("开始执行任务链（准备阶段）")
+	h.App.Logger.Info("开始执行免费公开视频准备阶段")
 	startTime := time.Now()
-
-	// 执行任务链
 	result := chain.Run(true)
-
-	duration := time.Since(startTime)
-	h.App.Logger.Infof("任务链执行完成, 耗时: %v", duration)
-
-	// 检查任务链是否成功执行（如果context中有错误信息，则认为失败）
-	success := true
-	if errorMsg, exists := result["error"]; exists && errorMsg != nil {
-		success = false
-		h.App.Logger.Errorf("任务链执行过程中发生错误: %v", errorMsg)
+	h.App.Logger.Infof("免费处理链执行完成, 耗时: %v", time.Since(startTime))
+	if errorValue, exists := result["error"]; exists && errorValue != nil {
+		h.App.Logger.Errorf("免费处理链失败: %v", errorValue)
+		_ = h.updateSavedVideoStatus(video.Id, "999")
+		return
 	}
-
-	// 根据执行结果更新任务状态
-	if success {
-		// 任务成功完成，更新状态为完成
-		if err := h.updateSavedVideoStatus(video.Id, "200"); err != nil {
-			h.App.Logger.Errorf("更新任务状态为完成时出错: %v", err)
-		} else {
-			h.App.Logger.Infof("任务 %s 执行成功，状态已更新为完成", video.VideoId)
-		}
-	} else {
-		// 任务失败，更新状态为失败
-		if err := h.updateSavedVideoStatus(video.Id, "999"); err != nil {
-			h.App.Logger.Errorf("更新任务状态为失败时出错: %v", err)
-		} else {
-			h.App.Logger.Errorf("任务 %s 执行失败，状态已更新为失败", video.VideoId)
-		}
+	if err := h.ChargeCompilationService.MarkFreeReady(video.VideoId); err != nil {
+		h.App.Logger.Errorf("保存免费稿件就绪时间失败: %v", err)
+		_ = h.updateSavedVideoStatus(video.Id, "999")
+		return
 	}
-
+	h.App.Logger.Infof("任务 %s 处理完成，将按就绪时间进入一小时上传队列", video.VideoId)
 }
 
 // RunSingleTaskStep 执行单个任务步骤
@@ -347,13 +403,9 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 
 	// 创建状态管理器
 	stateManager := manager.NewStateManager(video.Id, video.VideoId, currentDir, video.CreatedAt)
-	stepOrder := 0
-	if step, stepErr := h.TaskStepService.GetTaskStepByName(videoID, stepName); stepErr == nil {
-		stepOrder = step.StepOrder
-	}
 
 	// 单步重试时同步主任务状态，避免前端继续显示旧失败状态
-	if err := h.updateSavedVideoStatus(video.Id, getRetryRunningVideoStatus(stepOrder)); err != nil {
+	if err := h.updateSavedVideoStatus(video.Id, getRetryRunningVideoStatus(stepName)); err != nil {
 		h.App.Logger.Warnf("update retry-running status failed (videoID=%s, step=%s): %v", videoID, stepName, err)
 	}
 
@@ -377,7 +429,9 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 		task = handlers.NewDownloadVideo("下载视频", h.App, stateManager, h.App.CosClient, h.SavedVideoService)
 	case "分离音频":
 		task = handlers.NewExtractAudio("分离音频", h.App, stateManager, h.App.CosClient)
-	case "Whisper转录":
+	case "下载封面":
+		task = handlers.NewDownloadImgHandler("下载封面", h.App, stateManager, h.App.CosClient)
+	case "Whisper转录", "B站必剪转录":
 		// 从配置中读取 Whisper 参数
 		if h.App.Config.WhisperConfig != nil && h.App.Config.WhisperConfig.Enabled {
 			task = handlers.NewBcutHandler(
@@ -388,7 +442,10 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 				h.App.Config.WhisperConfig.Language,
 			)
 		} else {
-			return fmt.Errorf("B站必剪 未启用或配置不完整")
+			setupErr := fmt.Errorf("B站必剪 未启用或配置不完整")
+			_ = h.TaskStepService.UpdateTaskStepStatus(videoID, stepName, "failed", setupErr.Error())
+			_ = h.updateSavedVideoStatus(video.Id, getRetryFailedVideoStatus(stepName))
+			return setupErr
 		}
 	case "生成字幕":
 		task = handlers.NewGenerateSubtitles("生成字幕", h.App, stateManager, h.App.CosClient, h.SavedVideoService)
@@ -405,7 +462,10 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 		chain.AddTask(handlers.NewUploadSubtitleToBilibili("上传字幕到Bilibili", h.App, stateManager, h.App.CosClient, h.SavedVideoService))
 		chain.AddTask(handlers.NewPublishCommentHandler("发布章节评论", h.App, stateManager, h.App.CosClient, h.SavedVideoService))
 	default:
-		return fmt.Errorf("未知的任务步骤: %s", stepName)
+		setupErr := fmt.Errorf("未知的任务步骤: %s", stepName)
+		_ = h.TaskStepService.UpdateTaskStepStatus(videoID, stepName, "failed", setupErr.Error())
+		_ = h.updateSavedVideoStatus(video.Id, getRetryFailedVideoStatus(stepName))
+		return setupErr
 	}
 
 	// 添加任务到链
@@ -427,6 +487,14 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 		success = false
 		errorMsg = fmt.Sprintf("%v", errorMsgInterface)
 	}
+	retryRoute := ""
+	if success && stepName == "\u4e0b\u8f7d\u89c6\u9891" {
+		_, retryRoute, err = h.routeDownloadedTaskResult(videoID, result)
+		if err != nil {
+			success = false
+			errorMsg = fmt.Sprintf("route downloaded video after retry: %v", err)
+		}
+	}
 
 	// 更新步骤状态
 	if success {
@@ -438,14 +506,16 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 			h.App.Logger.Errorf("更新任务步骤结果失败: %v", err)
 		}
 		h.App.Logger.Infof("任务步骤 %s 执行成功", stepName)
-		if err := h.updateSavedVideoStatus(video.Id, getRetrySuccessVideoStatus(stepOrder)); err != nil {
-			h.App.Logger.Warnf("update retry-success status failed (videoID=%s, step=%s): %v", videoID, stepName, err)
+		if stepName != "\u4e0b\u8f7d\u89c6\u9891" || retryRoute == "free" {
+			if err := h.updateSavedVideoStatus(video.Id, getRetrySuccessVideoStatus(stepName)); err != nil {
+				h.App.Logger.Warnf("update retry-success status failed (videoID=%s, step=%s): %v", videoID, stepName, err)
+			}
 		}
 	} else {
 		if err := h.TaskStepService.UpdateTaskStepStatus(videoID, stepName, "failed", errorMsg); err != nil {
 			h.App.Logger.Errorf("更新任务步骤状态失败: %v", err)
 		}
-		if err := h.updateSavedVideoStatus(video.Id, getRetryFailedVideoStatus(stepOrder)); err != nil {
+		if err := h.updateSavedVideoStatus(video.Id, getRetryFailedVideoStatus(stepName)); err != nil {
 			h.App.Logger.Warnf("update retry-failed status failed (videoID=%s, step=%s): %v", videoID, stepName, err)
 		}
 		h.App.Logger.Errorf("任务步骤 %s 执行失败: %s", stepName, errorMsg)
@@ -453,6 +523,28 @@ func (h *ChainTaskHandler) RunSingleTaskStep(videoID, stepName string) error {
 	}
 
 	return nil
+}
+
+func (h *ChainTaskHandler) routeDownloadedTaskResult(videoID string, result map[string]interface{}) (string, string, error) {
+	downloadedFile, ok := result["downloaded_file"].(string)
+	if !ok || downloadedFile == "" {
+		return "", "", fmt.Errorf("download step returned no media path")
+	}
+
+	probeContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	probe, err := utils.ProbeMediaFile(probeContext, downloadedFile)
+	if err != nil {
+		return "", "", fmt.Errorf("probe downloaded media: %w", err)
+	}
+
+	route, err := h.ChargeCompilationService.RouteDownloadedVideo(
+		videoID,
+		downloadedFile,
+		probe.DurationMS,
+		probe.RawJSON,
+	)
+	return downloadedFile, route, err
 }
 
 // wrapTaskWithStepTracking 包装任务以添加步骤跟踪
@@ -575,35 +667,35 @@ func clampTaskProgress(percent int) int {
 	return percent
 }
 
-func getRetryRunningVideoStatus(stepOrder int) string {
-	switch stepOrder {
-	case 5:
+func getRetryRunningVideoStatus(stepName string) string {
+	switch stepName {
+	case "上传到Bilibili":
 		return "201"
-	case 6:
+	case "上传字幕到Bilibili":
 		return "301"
 	default:
 		return "002"
 	}
 }
 
-func getRetrySuccessVideoStatus(stepOrder int) string {
-	switch stepOrder {
-	case 4:
+func getRetrySuccessVideoStatus(stepName string) string {
+	switch stepName {
+	case "生成元数据":
 		return "200"
-	case 5:
+	case "上传到Bilibili":
 		return "300"
-	case 6:
+	case "上传字幕到Bilibili":
 		return "400"
 	default:
 		return "002"
 	}
 }
 
-func getRetryFailedVideoStatus(stepOrder int) string {
-	switch stepOrder {
-	case 5:
+func getRetryFailedVideoStatus(stepName string) string {
+	switch stepName {
+	case "上传到Bilibili":
 		return "299"
-	case 6:
+	case "上传字幕到Bilibili":
 		return "399"
 	default:
 		return "999"

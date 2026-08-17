@@ -3,7 +3,9 @@
 import AppLayout from '@/components/layout/AppLayout';
 import QRLogin from '@/components/auth/QRLogin';
 import { useAuth } from '@/hooks/useAuth';
-import { Plus, Youtube, Video, Globe, AlertCircle, CheckCircle } from 'lucide-react';
+import { Plus, Youtube, Video, Globe, AlertCircle, CheckCircle, Coins, ShieldCheck } from 'lucide-react';
+import { PublishAudience } from '@/types';
+import PreviewDurationSelect from '@/components/common/PreviewDurationSelect';
 import { useState } from 'react';
 import { APP_NAME_WITH_VERSION } from '@/lib/appVersion';
 import { getApiUrl } from '@/lib/apiBase';
@@ -14,6 +16,9 @@ export default function HomePage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitMessage, setSubmitMessage] = useState('');
   const [messageType, setMessageType] = useState<'success' | 'error' | ''>('');
+  const [publishAudience, setPublishAudience] = useState<PublishAudience>('');
+  const [previewSeconds, setPreviewSeconds] = useState(180);
+  const [rightsVerified, setRightsVerified] = useState(false);
 
   // 提交视频链接到后端
   const handleSubmitUrl = async (e: React.FormEvent) => {
@@ -21,6 +26,16 @@ export default function HomePage() {
     if (!videoUrl.trim()) {
       setMessageType('error');
       setSubmitMessage('请输入视频链接');
+      return;
+    }
+    if (!publishAudience) {
+      setMessageType('error');
+      setSubmitMessage('请选择免费公开、30元充电或50元充电');
+      return;
+    }
+    if (publishAudience !== 'free' && !rightsVerified) {
+      setMessageType('error');
+      setSubmitMessage('充电素材必须先确认版权或完整授权');
       return;
     }
 
@@ -44,6 +59,9 @@ export default function HomePage() {
           playlistId: '',
           timestamp: new Date().toISOString(),
           savedAt: new Date().toISOString(),
+          publish_audience: publishAudience,
+          preview_seconds: publishAudience === 'free' ? 0 : previewSeconds,
+          rights_verified: publishAudience === 'free' ? false : rightsVerified,
         }),
       });
 
@@ -53,6 +71,8 @@ export default function HomePage() {
         setMessageType('success');
         setSubmitMessage(`视频链接已成功提交！${result.data?.isExisting ? '(更新了现有记录)' : ''}`);
         setVideoUrl(''); // 清空输入框
+        setPublishAudience('');
+        setRightsVerified(false);
       } else {
         setMessageType('error');
         setSubmitMessage(result.message || '提交失败，请重试');
@@ -153,9 +173,65 @@ export default function HomePage() {
               </div>
             </div>
 
+            <fieldset className="space-y-3">
+              <legend className="text-sm font-medium text-gray-700">发布方式</legend>
+              <div className="grid gap-3 md:grid-cols-3">
+                {([
+                  ['free', '免费公开', '正常处理，完成1小时后自动上传'],
+                  ['charge_30', '30元充电', '进入30元素材池，等待随机拼接'],
+                  ['charge_50', '50元充电', '进入50元素材池，等待随机拼接'],
+                ] as const).map(([value, label, description]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => setPublishAudience(value)}
+                    disabled={isSubmitting}
+                    className={`rounded-lg border p-4 text-left transition ${
+                      publishAudience === value
+                        ? 'border-blue-500 bg-blue-50 ring-1 ring-blue-500'
+                        : 'border-gray-200 hover:border-blue-300'
+                    }`}
+                  >
+                    <span className="flex items-center gap-2 text-sm font-semibold text-gray-900">
+                      {value === 'free' ? <Globe className="h-4 w-4 text-blue-600" /> : <Coins className="h-4 w-4 text-pink-600" />}
+                      {label}
+                    </span>
+                    <span className="mt-1 block text-xs leading-5 text-gray-500">{description}</span>
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+
+            {publishAudience && publishAudience !== 'free' && (
+              <div className="space-y-3 rounded-lg border border-amber-200 bg-amber-50 p-4">
+                <label className="flex items-start gap-2 text-sm text-amber-950">
+                  <input
+                    type="checkbox"
+                    checked={rightsVerified}
+                    onChange={(event) => setRightsVerified(event.target.checked)}
+                    disabled={isSubmitting}
+                    className="mt-1"
+                  />
+                  <span className="flex-1">
+                    <span className="flex items-center gap-1 font-medium"><ShieldCheck className="h-4 w-4" />版权确认</span>
+                    我确认该素材为本人原创，或已取得允许付费传播的完整授权。
+                  </span>
+                </label>
+                <div className="flex flex-wrap items-center gap-2 text-xs text-amber-900">
+                  <span>默认试看时长</span>
+                  <PreviewDurationSelect
+                    value={previewSeconds}
+                    onChange={setPreviewSeconds}
+                    disabled={isSubmitting}
+                  />
+                  <span>最长6小时，拼接草稿中还可调整</span>
+                </div>
+              </div>
+            )}
+
             <button
               type="submit"
-              disabled={isSubmitting || !videoUrl.trim()}
+              disabled={isSubmitting || !videoUrl.trim() || !publishAudience || (publishAudience !== 'free' && !rightsVerified)}
               className="w-full flex items-center justify-center px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors font-medium"
             >
               {isSubmitting ? (

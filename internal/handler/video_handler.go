@@ -11,26 +11,29 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 type VideoHandler struct {
 	BaseHandler
-	SavedVideoService *services.SavedVideoService
-	TaskStepService   *services.TaskStepService
-	UploadScheduler   interface {
+	SavedVideoService        *services.SavedVideoService
+	TaskStepService          *services.TaskStepService
+	ChargeCompilationService *services.ChargeCompilationService
+	UploadScheduler          interface {
 		ExecuteManualUpload(videoID, taskType string) error
 	}
 	AnalyticsHandler *AnalyticsHandler
 }
 
-func NewVideoHandler(app *core.AppServer, savedVideoService *services.SavedVideoService, taskStepService *services.TaskStepService) *VideoHandler {
+func NewVideoHandler(app *core.AppServer, savedVideoService *services.SavedVideoService, taskStepService *services.TaskStepService, chargeCompilationService *services.ChargeCompilationService) *VideoHandler {
 	return &VideoHandler{
-		BaseHandler:       BaseHandler{App: app},
-		SavedVideoService: savedVideoService,
-		TaskStepService:   taskStepService,
-		UploadScheduler:   nil, // Will be set later via SetUploadScheduler
+		BaseHandler:              BaseHandler{App: app},
+		SavedVideoService:        savedVideoService,
+		TaskStepService:          taskStepService,
+		ChargeCompilationService: chargeCompilationService,
+		UploadScheduler:          nil, // Will be set later via SetUploadScheduler
 	}
 }
 
@@ -47,9 +50,11 @@ func (h *VideoHandler) RegisterRoutes(api *gin.RouterGroup) {
 	{
 		video.GET("", h.getVideoList)
 		video.GET("/:id", h.getVideoDetail)
+		video.GET("/:id/cover", h.getVideoCover)
 		video.POST("/:id/steps/:stepName/retry", h.retryTaskStep)
 		video.GET("/:id/files", h.getVideoFiles)
 		video.POST("/:id/upload/video", h.manualUploadVideo)
+		video.PUT("/:id/publish-audience", h.selectPublishAudience)
 		video.POST("/:id/upload/subtitle", h.manualUploadSubtitle)
 	}
 }
@@ -71,27 +76,37 @@ type VideoListData struct {
 
 // VideoInfo 视频信息
 type VideoInfo struct {
-	ID             uint                   `json:"id"`
-	VideoID        string                 `json:"video_id"`
-	Title          string                 `json:"title"`
-	URL            string                 `json:"url"`
-	Status         string                 `json:"status"`
-	Chapters       string                 `json:"chapters"`
-	ChaptersStatus string                 `json:"chapters_status"`
-	ChaptersMessage string                `json:"chapters_message"`
-	ChaptersExtracted bool                `json:"chapters_extracted"`
-	ChaptersCount int                    `json:"chapters_count"`
-	GeneratedTitle string                 `json:"generated_title"`
-	GeneratedDesc  string                 `json:"generated_desc"`
-	GeneratedTags  string                 `json:"generated_tags"`
-	BiliBVID       string                 `json:"bili_bvid"`
-	BiliAID        int64                  `json:"bili_aid"`
-	CreatedAt      string                 `json:"created_at"`
-	UpdatedAt      string                 `json:"updated_at"`
-	TaskSteps      []TaskStepInfo         `json:"task_steps,omitempty"`
-	Progress       map[string]interface{} `json:"progress,omitempty"`
-	CoverImage     string                 `json:"cover_image,omitempty"`
-	MetaData       map[string]interface{} `json:"meta_data,omitempty"`
+	ID                   uint                   `json:"id"`
+	VideoID              string                 `json:"video_id"`
+	Title                string                 `json:"title"`
+	URL                  string                 `json:"url"`
+	Status               string                 `json:"status"`
+	Chapters             string                 `json:"chapters"`
+	ChaptersStatus       string                 `json:"chapters_status"`
+	ChaptersMessage      string                 `json:"chapters_message"`
+	ChaptersExtracted    bool                   `json:"chapters_extracted"`
+	ChaptersCount        int                    `json:"chapters_count"`
+	GeneratedTitle       string                 `json:"generated_title"`
+	GeneratedDesc        string                 `json:"generated_desc"`
+	GeneratedTags        string                 `json:"generated_tags"`
+	BiliBVID             string                 `json:"bili_bvid"`
+	BiliAID              int64                  `json:"bili_aid"`
+	PublishAudience      string                 `json:"publish_audience"`
+	AudienceSelectedAt   string                 `json:"audience_selected_at,omitempty"`
+	UPowerPreviewSeconds int                    `json:"upower_preview_seconds"`
+	RecordType           string                 `json:"record_type"`
+	WorkflowState        string                 `json:"workflow_state"`
+	MediaDurationMS      int64                  `json:"media_duration_ms"`
+	ReadyAt              string                 `json:"ready_at,omitempty"`
+	ScheduledUploadAt    string                 `json:"scheduled_upload_at,omitempty"`
+	UploadPolicy         string                 `json:"upload_policy"`
+	RightsVerified       bool                   `json:"rights_verified"`
+	CreatedAt            string                 `json:"created_at"`
+	UpdatedAt            string                 `json:"updated_at"`
+	TaskSteps            []TaskStepInfo         `json:"task_steps,omitempty"`
+	Progress             map[string]interface{} `json:"progress,omitempty"`
+	CoverImage           string                 `json:"cover_image,omitempty"`
+	MetaData             map[string]interface{} `json:"meta_data,omitempty"`
 }
 
 // TaskStepInfo 任务步骤信息
@@ -149,24 +164,35 @@ func (h *VideoHandler) getVideoList(c *gin.Context) {
 		chaptersDetail := buildVideoChaptersDetail(&sv, nil)
 
 		videos = append(videos, VideoInfo{
-			ID:                sv.ID,
-			VideoID:           sv.VideoID,
-			Title:             sv.Title,
-			URL:               sv.URL,
-			Status:            sv.Status,
-			Chapters:          chaptersDetail.Chapters,
-			ChaptersStatus:    chaptersDetail.Status,
-			ChaptersMessage:   chaptersDetail.Message,
-			ChaptersExtracted: chaptersDetail.Extracted,
-			ChaptersCount:     chaptersDetail.Count,
-			GeneratedTitle:    sv.GeneratedTitle,
-			GeneratedDesc:     sv.GeneratedDesc,
-			GeneratedTags:     sv.GeneratedTags,
-			BiliBVID:          sv.BiliBVID,
-			BiliAID:           sv.BiliAID,
-			CreatedAt:         sv.CreatedAt.Format("2006-01-02 15:04:05"),
-			UpdatedAt:         sv.UpdatedAt.Format("2006-01-02 15:04:05"),
-			Progress:          progress,
+			ID:                   sv.ID,
+			VideoID:              sv.VideoID,
+			Title:                sv.Title,
+			URL:                  sv.URL,
+			Status:               sv.Status,
+			Chapters:             chaptersDetail.Chapters,
+			ChaptersStatus:       chaptersDetail.Status,
+			ChaptersMessage:      chaptersDetail.Message,
+			ChaptersExtracted:    chaptersDetail.Extracted,
+			ChaptersCount:        chaptersDetail.Count,
+			GeneratedTitle:       sv.GeneratedTitle,
+			GeneratedDesc:        sv.GeneratedDesc,
+			GeneratedTags:        sv.GeneratedTags,
+			BiliBVID:             sv.BiliBVID,
+			BiliAID:              sv.BiliAID,
+			PublishAudience:      sv.PublishAudience,
+			AudienceSelectedAt:   formatOptionalTime(sv.AudienceSelectedAt),
+			UPowerPreviewSeconds: sv.UPowerPreviewSeconds,
+			RecordType:           sv.RecordType,
+			WorkflowState:        sv.WorkflowState,
+			MediaDurationMS:      sv.MediaDurationMS,
+			ReadyAt:              formatOptionalTime(sv.ReadyAt),
+			ScheduledUploadAt:    formatOptionalTime(sv.ScheduledUploadAt),
+			UploadPolicy:         sv.UploadPolicy,
+			RightsVerified:       sv.RightsVerified,
+			CoverImage:           h.getVideoCoverImage(sv.VideoID),
+			CreatedAt:            sv.CreatedAt.Format("2006-01-02 15:04:05"),
+			UpdatedAt:            sv.UpdatedAt.Format("2006-01-02 15:04:05"),
+			Progress:             progress,
 		})
 	}
 
@@ -259,27 +285,37 @@ func (h *VideoHandler) getVideoDetail(c *gin.Context) {
 	chaptersDetail := buildVideoChaptersDetail(savedVideo, taskStepInfos)
 
 	videoInfo := VideoInfo{
-		ID:                savedVideo.ID,
-		VideoID:           savedVideo.VideoID,
-		Title:             savedVideo.Title,
-		URL:               savedVideo.URL,
-		Status:            savedVideo.Status,
-		Chapters:          chaptersDetail.Chapters,
-		ChaptersStatus:    chaptersDetail.Status,
-		ChaptersMessage:   chaptersDetail.Message,
-		ChaptersExtracted: chaptersDetail.Extracted,
-		ChaptersCount:     chaptersDetail.Count,
-		GeneratedTitle:    savedVideo.GeneratedTitle,
-		GeneratedDesc:     savedVideo.GeneratedDesc,
-		GeneratedTags:     savedVideo.GeneratedTags,
-		BiliBVID:          savedVideo.BiliBVID,
-		BiliAID:           savedVideo.BiliAID,
-		CreatedAt:         savedVideo.CreatedAt.Format("2006-01-02 15:04:05"),
-		UpdatedAt:         savedVideo.UpdatedAt.Format("2006-01-02 15:04:05"),
-		TaskSteps:         taskStepInfos,
-		Progress:          progress,
-		CoverImage:        coverImage,
-		MetaData:          metaData,
+		ID:                   savedVideo.ID,
+		VideoID:              savedVideo.VideoID,
+		Title:                savedVideo.Title,
+		URL:                  savedVideo.URL,
+		Status:               savedVideo.Status,
+		Chapters:             chaptersDetail.Chapters,
+		ChaptersStatus:       chaptersDetail.Status,
+		ChaptersMessage:      chaptersDetail.Message,
+		ChaptersExtracted:    chaptersDetail.Extracted,
+		ChaptersCount:        chaptersDetail.Count,
+		GeneratedTitle:       savedVideo.GeneratedTitle,
+		GeneratedDesc:        savedVideo.GeneratedDesc,
+		GeneratedTags:        savedVideo.GeneratedTags,
+		BiliBVID:             savedVideo.BiliBVID,
+		BiliAID:              savedVideo.BiliAID,
+		PublishAudience:      savedVideo.PublishAudience,
+		AudienceSelectedAt:   formatOptionalTime(savedVideo.AudienceSelectedAt),
+		UPowerPreviewSeconds: savedVideo.UPowerPreviewSeconds,
+		RecordType:           savedVideo.RecordType,
+		WorkflowState:        savedVideo.WorkflowState,
+		MediaDurationMS:      savedVideo.MediaDurationMS,
+		ReadyAt:              formatOptionalTime(savedVideo.ReadyAt),
+		ScheduledUploadAt:    formatOptionalTime(savedVideo.ScheduledUploadAt),
+		UploadPolicy:         savedVideo.UploadPolicy,
+		RightsVerified:       savedVideo.RightsVerified,
+		CreatedAt:            savedVideo.CreatedAt.Format("2006-01-02 15:04:05"),
+		UpdatedAt:            savedVideo.UpdatedAt.Format("2006-01-02 15:04:05"),
+		TaskSteps:            taskStepInfos,
+		Progress:             progress,
+		CoverImage:           coverImage,
+		MetaData:             metaData,
 	}
 
 	c.JSON(http.StatusOK, VideoListResponse{
@@ -287,6 +323,13 @@ func (h *VideoHandler) getVideoDetail(c *gin.Context) {
 		Message: "success",
 		Data:    videoInfo,
 	})
+}
+
+func formatOptionalTime(value *time.Time) string {
+	if value == nil {
+		return ""
+	}
+	return value.Format("2006-01-02 15:04:05")
 }
 
 type videoChaptersDetail struct {
@@ -596,28 +639,55 @@ func (h *VideoHandler) getVideoMetaData(videoID string) map[string]interface{} {
 
 // getVideoCoverImage 获取视频封面图片路径
 func (h *VideoHandler) getVideoCoverImage(videoID string) string {
-	videoDir := h.getVideoDirectory(videoID)
-	coverExtensions := []string{".jpg", ".jpeg", ".png", ".webp"}
-
-	for _, ext := range coverExtensions {
-		coverPath := filepath.Join(videoDir, "cover"+ext)
-		if _, err := os.Stat(coverPath); err == nil {
-			// 返回相对于静态文件服务器的路径
-			return fmt.Sprintf("/static/videos/%s/cover%s", videoID, ext)
-		}
+	if h.findVideoCoverPath(videoID) != "" {
+		return fmt.Sprintf("/api/v1/videos/%s/cover", videoID)
 	}
-
 	return ""
 }
 
-// getVideoDirectory 获取视频文件目录
-func (h *VideoHandler) getVideoDirectory(videoID string) string {
-	// 根据配置获取文件上传目录
-	baseDir := h.App.Config.FileUpDir
+func (h *VideoHandler) findVideoCoverPath(videoID string) string {
+	if strings.TrimSpace(videoID) == "" || filepath.Base(videoID) != videoID {
+		return ""
+	}
+	candidates := []string{
+		"cover.jpg", "cover.jpeg", "cover.png", "cover.webp",
+		"maxresdefault.jpg", "maxresdefault.jpeg", "maxresdefault.png", "maxresdefault.webp",
+		videoID + ".jpg", videoID + ".jpeg", videoID + ".png", videoID + ".webp",
+	}
+	for _, dirPattern := range h.getVideoDirectoryPatterns(videoID) {
+		directories, _ := filepath.Glob(dirPattern)
+		for _, directory := range directories {
+			for _, filename := range candidates {
+				path := filepath.Join(directory, filename)
+				if info, err := os.Stat(path); err == nil && !info.IsDir() {
+					return path
+				}
+			}
+		}
+	}
+	return ""
+}
 
-	// 按日期组织的目录结构：/file_upload/media/2025-10-13/videoID/
-	// 这里简化处理，实际需要根据创建时间确定日期
-	return filepath.Join(baseDir, "media", "*", videoID)
+func (h *VideoHandler) getVideoCover(c *gin.Context) {
+	path := h.findVideoCoverPath(c.Param("id"))
+	if path == "" {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.File(path)
+}
+
+func (h *VideoHandler) getVideoDirectoryPatterns(videoID string) []string {
+	baseDir := filepath.Clean(h.App.Config.FileUpDir)
+	return []string{
+		filepath.Join(baseDir, "*", videoID),
+		filepath.Join(baseDir, "media", "*", videoID),
+	}
+}
+
+// getVideoDirectory ????????
+func (h *VideoHandler) getVideoDirectory(videoID string) string {
+	return h.getVideoDirectoryPatterns(videoID)[0]
 }
 
 // listVideoFiles 列出视频目录中的所有文件
@@ -680,6 +750,65 @@ func (h *VideoHandler) getFileType(filename string) string {
 }
 
 // manualUploadVideo 手动触发视频上传
+func (h *VideoHandler) selectPublishAudience(c *gin.Context) {
+	idStr := c.Param("id")
+	var savedVideo *model.SavedVideo
+	var err error
+	if id, parseErr := strconv.ParseUint(idStr, 10, 32); parseErr == nil {
+		savedVideo, err = h.SavedVideoService.GetByID(uint(id))
+	} else {
+		savedVideo, err = h.SavedVideoService.GetVideoByVideoID(idStr)
+	}
+	if err != nil {
+		c.JSON(http.StatusNotFound, VideoListResponse{Code: 404, Message: "视频不存在"})
+		return
+	}
+
+	var request struct {
+		Audience       string `json:"audience" binding:"required"`
+		PreviewSeconds int    `json:"preview_seconds"`
+		RightsVerified bool   `json:"rights_verified"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, VideoListResponse{Code: 400, Message: "请选择发布范围"})
+		return
+	}
+	labels := map[string]string{
+		"free":      "免费公开",
+		"charge_30": "30元充电视频专属",
+		"charge_50": "50元充电视频专属",
+	}
+	label, valid := labels[request.Audience]
+	if !valid {
+		c.JSON(http.StatusBadRequest, VideoListResponse{Code: 400, Message: "无效的发布范围"})
+		return
+	}
+	classified, err := h.ChargeCompilationService.ClassifyVideo(
+		savedVideo.VideoID,
+		request.Audience,
+		request.PreviewSeconds,
+		request.RightsVerified,
+	)
+	if err != nil {
+		h.App.Logger.Warnf("保存视频发布范围失败: %v", err)
+		c.JSON(http.StatusConflict, VideoListResponse{Code: 409, Message: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, VideoListResponse{
+		Code:    200,
+		Message: "发布范围已选择",
+		Data: gin.H{
+			"publish_audience":       classified.PublishAudience,
+			"publish_audience_label": label,
+			"preview_seconds":        classified.UPowerPreviewSeconds,
+			"status":                 classified.Status,
+			"workflow_state":         classified.WorkflowState,
+			"ready_at":               formatOptionalTime(classified.ReadyAt),
+			"scheduled_upload_at":    formatOptionalTime(classified.ScheduledUploadAt),
+		},
+	})
+}
+
 func (h *VideoHandler) manualUploadVideo(c *gin.Context) {
 	idStr := c.Param("id")
 
@@ -719,39 +848,52 @@ func (h *VideoHandler) manualUploadVideo(c *gin.Context) {
 		})
 		return
 	}
-
-	h.App.Logger.Infof("🚀 用户手动触发视频上传: %s (%s)", savedVideo.VideoID, savedVideo.Title)
-
-	// 更新状态为上传中
-	if err := h.SavedVideoService.UpdateStatus(savedVideo.ID, "201"); err != nil {
-		h.App.Logger.Errorf("更新视频状态失败: %v", err)
-		c.JSON(http.StatusInternalServerError, VideoListResponse{
-			Code:    500,
-			Message: "更新视频状态失败",
+	if savedVideo.BiliBVID != "" || savedVideo.BiliAID != 0 {
+		c.JSON(http.StatusBadRequest, VideoListResponse{
+			Code:    400,
+			Message: "视频已经上传到Bilibili，不能重复上传",
+		})
+		return
+	}
+	if savedVideo.RecordType != model.RecordTypeCompilation &&
+		(savedVideo.PublishAudience == "charge_30" || savedVideo.PublishAudience == "charge_50") {
+		c.JSON(http.StatusBadRequest, VideoListResponse{
+			Code: 400, Message: "充电源素材不能单独上传，请从对应素材池创建拼接批次",
+		})
+		return
+	}
+	if savedVideo.PublishAudience == "" {
+		c.JSON(http.StatusBadRequest, VideoListResponse{
+			Code:    400,
+			Message: "请先选择免费公开、30元充电视频专属或50元充电视频专属",
+		})
+		return
+	}
+	if (savedVideo.PublishAudience == "charge_30" || savedVideo.PublishAudience == "charge_50") &&
+		savedVideo.UPowerPreviewSeconds <= 0 {
+		c.JSON(http.StatusBadRequest, VideoListResponse{
+			Code: 400, Message: "请先设置充电专属视频试看时间",
 		})
 		return
 	}
 
-	// 异步执行上传任务
-	go func() {
-		if err := h.UploadScheduler.ExecuteManualUpload(savedVideo.VideoID, "video"); err != nil {
-			h.App.Logger.Errorf("手动上传视频失败: %v", err)
-			// 上传失败，更新状态为 299
-			h.SavedVideoService.UpdateStatus(savedVideo.ID, "299")
-		} else {
-			h.App.Logger.Infof("✅ 手动上传视频成功: %s", savedVideo.VideoID)
-			// 上传成功，更新状态为 300
-			h.SavedVideoService.UpdateStatus(savedVideo.ID, "300")
-		}
-	}()
+	h.App.Logger.Infof("🚀 用户手动触发视频上传: %s (%s)", savedVideo.VideoID, savedVideo.Title)
+	if err := h.UploadScheduler.ExecuteManualUpload(savedVideo.VideoID, "video"); err != nil {
+		h.App.Logger.Errorf("创建手动上传任务失败: %v", err)
+		c.JSON(http.StatusConflict, VideoListResponse{
+			Code:    409,
+			Message: err.Error(),
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, VideoListResponse{
 		Code:    200,
-		Message: "视频上传任务已启动",
+		Message: "视频上传任务已进入持久化队列",
 		Data: gin.H{
 			"video_id": savedVideo.VideoID,
-			"status":   "201",
-			"message":  "视频正在后台上传中，请稍后刷新查看结果",
+			"status":   "queued",
+			"message":  "视频将在后台上传，服务重启后也会继续执行",
 		},
 	})
 }

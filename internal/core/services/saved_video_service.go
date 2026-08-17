@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/difyz9/ytb2bili/pkg/store/model"
 	"gorm.io/gorm"
@@ -22,7 +23,7 @@ func NewSavedVideoService(db *gorm.DB) *SavedVideoService {
 // GetPendingVideos 获取待处理的视频列表（状态为 001 且 subtitles 不为空）
 func (s *SavedVideoService) GetPendingVideos(limit int) ([]model.SavedVideo, error) {
 	var videos []model.SavedVideo
-	err := s.DB.Where("status = ?", "001").
+	err := s.DB.Where("status IN ?", []string{"001", "101"}).
 		Order("created_at ASC").
 		Limit(limit).
 		Find(&videos).Error
@@ -67,6 +68,22 @@ func (s *SavedVideoService) TryUpdateStatus(id uint, fromStatus, toStatus string
 	}
 	if result.RowsAffected > 1 {
 		return false, fmt.Errorf("unexpected rows affected while updating video status: %d", result.RowsAffected)
+	}
+	return result.RowsAffected == 1, nil
+}
+
+// SelectPublishAudience records the required human decision and starts the
+// automatic-upload waiting period atomically.
+func (s *SavedVideoService) SelectPublishAudience(id uint, audience string, previewSeconds int) (bool, error) {
+	result := s.DB.Model(&model.SavedVideo{}).
+		Where("id = ? AND status IN ? AND (bili_bv_id = ? OR bili_bv_id IS NULL) AND (bili_a_id = ? OR bili_a_id IS NULL)", id, []string{"200", "299"}, "", 0).
+		Updates(map[string]interface{}{
+			"publish_audience":       audience,
+			"audience_selected_at":   time.Now(),
+			"upower_preview_seconds": previewSeconds,
+		})
+	if result.Error != nil {
+		return false, result.Error
 	}
 	return result.RowsAffected == 1, nil
 }

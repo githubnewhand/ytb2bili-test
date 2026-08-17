@@ -21,6 +21,18 @@ export interface Video {
   updated_at: string;
   subtitles?: Subtitle[];
   upload_result?: UploadResult;
+  bili_bvid?: string;
+  bili_aid?: number;
+  publish_audience?: PublishAudience;
+  audience_selected_at?: string;
+  upower_preview_seconds?: number;
+  record_type?: 'source' | 'compilation';
+  workflow_state?: string;
+  media_duration_ms?: number;
+  ready_at?: string;
+  scheduled_upload_at?: string;
+  upload_policy?: 'scheduled' | 'manual' | 'immediate';
+  rights_verified?: boolean;
 }
 
 export interface TaskStep {
@@ -70,6 +82,18 @@ export interface VideoDetail {
   generated_description?: string;
   generated_desc?: string;
   generated_tags?: string;
+  bili_bvid?: string;
+  bili_aid?: number;
+  publish_audience?: PublishAudience;
+  audience_selected_at?: string;
+  upower_preview_seconds?: number;
+  record_type?: 'source' | 'compilation';
+  workflow_state?: string;
+  media_duration_ms?: number;
+  ready_at?: string;
+  scheduled_upload_at?: string;
+  upload_policy?: 'scheduled' | 'manual' | 'immediate';
+  rights_verified?: boolean;
   cover_image?: string;
   task_steps: TaskStep[];
   progress: TaskProgress;
@@ -86,7 +110,9 @@ export interface VideoFile {
 
 export type TaskStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
 
-export type VideoStatus = '001' | '002' | '200' | '201' | '299' | '300' | '301' | '399' | '400' | '999';
+export type VideoStatus = '001' | '002' | '100' | '101' | '110' | '200' | '201' | '299' | '300' | '301' | '399' | '400' | '999';
+
+export type PublishAudience = '' | 'free' | 'charge_30' | 'charge_50';
 
 export interface Subtitle {
   id?: number;
@@ -162,3 +188,73 @@ export const TASK_STEP_NAMES = {
   'upload_to_bilibili': '上传到B站',
   'upload_subtitles': '上传字幕',
 } as const;
+
+export type ChargeTier = 30 | 50;
+export type ChargePoolState = 'available' | 'reserved' | 'consumed' | 'error';
+export type CompilationState =
+  | 'draft'
+  | 'queued'
+  | 'merging'
+  | 'processing'
+  | 'ready'
+  | 'upload_queued'
+  | 'uploading'
+  | 'uploaded'
+  | 'merge_failed'
+  | 'processing_failed'
+  | 'upload_failed'
+  | 'cancelled';
+
+export interface ChargePoolSummary {
+  tier: ChargeTier;
+  available: number;
+  reserved: number;
+  consumed: number;
+  total: number;
+}
+
+export interface ChargePoolItem {
+  id: number;
+  saved_video_id: number;
+  tier: ChargeTier;
+  state: ChargePoolState;
+  reserved_batch_id?: number;
+  saved_video?: Video;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CompilationItem {
+  id: number;
+  batch_id: number;
+  source_saved_video_id: number;
+  position: number;
+  source_duration_ms: number;
+  timeline_start_ms: number;
+  timeline_end_ms: number;
+  source_path_snapshot: string;
+  source_video?: Video;
+}
+
+export interface CompilationBatch {
+  id: number;
+  batch_key: string;
+  tier: ChargeTier;
+  state: CompilationState;
+  target_count: number;
+  actual_count: number;
+  random_seed: number;
+  output_saved_video_id?: number;
+  preview_seconds: number;
+  total_duration_ms: number;
+  output_path?: string;
+  last_error?: string;
+  retry_count: number;
+  upload_policy: 'manual' | 'immediate';
+  started_at?: string;
+  completed_at?: string;
+  items: CompilationItem[];
+  output_saved_video?: Video;
+  created_at: string;
+  updated_at: string;
+}

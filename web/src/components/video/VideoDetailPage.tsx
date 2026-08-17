@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { ArrowLeft, ExternalLink, RefreshCw, Download, Calendar, Clock, Image, FileText, Play, Eye } from 'lucide-react';
+import { ArrowLeft, ExternalLink, RefreshCw, Download, Calendar, Clock, Image as ImageIcon, FileText, Play, Eye } from 'lucide-react';
 import { VideoDetail, VideoFile, TASK_STEP_NAMES } from '@/types';
 import { videoApi } from '@/lib/api';
 import TaskStepList from './TaskStepList';
@@ -159,7 +159,7 @@ export default function VideoDetailPage({ videoId, onBack }: VideoDetailPageProp
       case 'subtitle':
         return <FileText className={className} />;
       case 'cover':
-        return <Image className={className} />;
+        return <ImageIcon className={className} />;
       default:
         return <FileText className={className} />;
     }
@@ -296,6 +296,18 @@ export default function VideoDetailPage({ videoId, onBack }: VideoDetailPageProp
                       <span>查看封面</span>
                     </a>
                   )}
+
+                  {video.bili_bvid && (
+                    <a
+                      href={`https://www.bilibili.com/video/${video.bili_bvid}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-sm text-blue-600 hover:text-blue-800 flex items-center space-x-1"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                      <span>打开B站稿件</span>
+                    </a>
+                  )}
                 </div>
               </div>
 
@@ -391,6 +403,11 @@ export default function VideoDetailPage({ videoId, onBack }: VideoDetailPageProp
             <VideoActions 
               videoId={video.video_id} 
               status={video.status}
+              biliBvid={video.bili_bvid}
+              biliAid={video.bili_aid}
+              publishAudience={video.publish_audience}
+              audienceSelectedAt={video.audience_selected_at}
+              upowerPreviewSeconds={video.upower_preview_seconds}
               onSuccess={handleRefresh}
             />
 

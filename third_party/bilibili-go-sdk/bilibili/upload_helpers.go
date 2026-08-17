@@ -2,6 +2,7 @@ package bilibili
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,8 +11,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type uploadProgressReader struct {
@@ -64,10 +69,6 @@ func (uc *UploadClient) preUpload(fileName string, fileSize int64) (*PreUploadIn
 
 	// 添加必要的参数 - 参考 biliup-rs 的实现
 	params.Set("probe_version", "20221109")
-	// upcdn: bda2 表示使用百度云 CDN
-	// zone: cs 表示云存储区域
-	params.Set("upcdn", "bda2")
-	params.Set("zone", "cs")
 
 	// 获取cookies用于认证
 	cookies := uc.loginInfo.GetCookieString()
@@ -167,92 +168,184 @@ func (uc *UploadClient) uploadChunks(videoPath string, preInfo *PreUploadInfo, u
 	fileSize := fileInfo.Size()
 	chunkSize := int64(preInfo.ChunkSize)
 	chunksNum := int((fileSize + chunkSize - 1) / chunkSize) // 向上取整
+	concurrency := normalizeUploadConcurrency(preInfo.Threads)
+	if uc.uploadConcurrency > 0 && uc.uploadConcurrency < concurrency {
+		concurrency = uc.uploadConcurrency
+	}
 
-	log.Printf("Starting chunk upload: fileSize=%d, chunkSize=%d, chunksNum=%d", fileSize, chunkSize, chunksNum)
+	log.Printf("Starting chunk upload: fileSize=%d, chunkSize=%d, chunksNum=%d, concurrency=%d", fileSize, chunkSize, chunksNum, concurrency)
 	uc.reportUploadProgress(0, fileSize, 0, chunksNum)
 
 	uploadURL := fmt.Sprintf("https:%s/%s",
 		preInfo.Endpoint,
 		strings.Replace(preInfo.UposUri, "upos://", "", 1))
 
-	var parts []map[string]interface{}
+	type chunkTask struct {
+		index int
+		start int64
+		end   int64
+	}
+	type chunkResult struct {
+		part map[string]interface{}
+		err  error
+	}
 
-	for i := 0; i < chunksNum; i++ {
-		start := int64(i) * chunkSize
-		end := start + chunkSize
-		if end > fileSize {
-			end = fileSize
-		}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-		chunkData := make([]byte, end-start)
-		_, err := file.ReadAt(chunkData, start)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read chunk %d: %v", i, err)
-		}
+	tasks := make(chan chunkTask)
+	results := make(chan chunkResult, chunksNum)
+	var completed int32
+	var uploadedBytes int64
+	var wg sync.WaitGroup
 
-		// 上传分块（带重试）
-		params := url.Values{}
-		params.Set("uploadId", uploadID)
-		params.Set("chunks", strconv.Itoa(chunksNum))
-		params.Set("total", strconv.FormatInt(fileSize, 10))
-		params.Set("chunk", strconv.Itoa(i))
-		params.Set("size", strconv.Itoa(len(chunkData)))
-		params.Set("partNumber", strconv.Itoa(i+1))
-		params.Set("start", strconv.FormatInt(start, 10))
-		params.Set("end", strconv.FormatInt(end, 10))
-
-		// 计算上传进度
-		progress := float64(i+1) / float64(chunksNum) * 100
-		log.Printf("📤 Uploading chunk %d/%d (%.1f%%) - bytes %d-%d, size=%d",
-			i+1, chunksNum, progress, start, end, len(chunkData))
-
-		err = retryFunc(func() error {
-			body := &uploadProgressReader{
-				reader: bytes.NewReader(chunkData),
-				onRead: func(readBytes int64) {
-					uc.reportUploadProgress(start+readBytes, fileSize, i+1, chunksNum)
-				},
+	worker := func() {
+		defer wg.Done()
+		for task := range tasks {
+			select {
+			case <-ctx.Done():
+				return
+			default:
 			}
-			req, err := http.NewRequest("PUT", uploadURL+"?"+params.Encode(), body)
+
+			part, err := uc.uploadPart(ctx, file, uploadURL, preInfo, uploadID, fileSize, chunksNum, task.index, task.start, task.end, &uploadedBytes)
 			if err != nil {
-				return fmt.Errorf("failed to create request: %v", err)
-			}
-			req.ContentLength = int64(len(chunkData))
-
-			req.Header.Set("X-Upos-Auth", preInfo.Auth)
-			req.Header.Set("Content-Length", strconv.Itoa(len(chunkData)))
-			req.Header.Set("User-Agent", uc.client.userAgent)
-			req.Header.Set("Connection", "keep-alive")
-
-			// 使用专门的上传客户端（更长的超时时间）
-			resp, err := uc.uploadClient.Do(req)
-			if err != nil {
-				return fmt.Errorf("network error uploading chunk %d: %v", i+1, err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				bodyBytes, _ := io.ReadAll(resp.Body)
-				return fmt.Errorf("upload chunk %d failed with status %s: %s", i+1, resp.Status, string(bodyBytes))
+				results <- chunkResult{err: err}
+				cancel()
+				return
 			}
 
-			log.Printf("✅ Chunk %d/%d uploaded successfully (%.1f%% complete)", i+1, chunksNum, progress)
-			uc.reportUploadProgress(end, fileSize, i+1, chunksNum)
-			return nil
-		})
-
-		if err != nil {
-			return nil, err
+			done := atomic.AddInt32(&completed, 1)
+			percent := float64(done) / float64(chunksNum) * 100
+			log.Printf("Chunk uploaded successfully: partNumber=%d, completed=%d/%d, percent=%.1f%%",
+				task.index+1, done, chunksNum, percent)
+			results <- chunkResult{part: part}
 		}
+	}
 
-		parts = append(parts, map[string]interface{}{
-			"partNumber": i + 1,
-			"eTag":       "etag",
-		})
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
+	go func() {
+		defer close(tasks)
+		for i := 0; i < chunksNum; i++ {
+			start := int64(i) * chunkSize
+			end := start + chunkSize
+			if end > fileSize {
+				end = fileSize
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case tasks <- chunkTask{index: i, start: start, end: end}:
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	parts := make([]map[string]interface{}, 0, chunksNum)
+	for result := range results {
+		if result.err != nil {
+			cancel()
+			for range results {
+			}
+			return nil, result.err
+		}
+		parts = append(parts, result.part)
+	}
+
+	if len(parts) != chunksNum {
+		return nil, fmt.Errorf("chunk upload canceled: uploaded %d/%d chunks", len(parts), chunksNum)
 	}
 
 	log.Printf("All %d chunks uploaded successfully", chunksNum)
 	return parts, nil
+}
+
+func (uc *UploadClient) uploadPart(ctx context.Context, file *os.File, uploadURL string, preInfo *PreUploadInfo, uploadID string, fileSize int64, chunksNum, chunkIndex int, start, end int64, uploadedBytes *int64) (map[string]interface{}, error) {
+	chunkData := make([]byte, end-start)
+	_, err := file.ReadAt(chunkData, start)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read chunk %d: %v", chunkIndex, err)
+	}
+
+	params := url.Values{}
+	params.Set("uploadId", uploadID)
+	params.Set("chunks", strconv.Itoa(chunksNum))
+	params.Set("total", strconv.FormatInt(fileSize, 10))
+	params.Set("chunk", strconv.Itoa(chunkIndex))
+	params.Set("size", strconv.Itoa(len(chunkData)))
+	params.Set("partNumber", strconv.Itoa(chunkIndex+1))
+	params.Set("start", strconv.FormatInt(start, 10))
+	params.Set("end", strconv.FormatInt(end, 10))
+
+	log.Printf("Uploading chunk: partNumber=%d/%d, bytes=%d-%d, size=%d",
+		chunkIndex+1, chunksNum, start, end, len(chunkData))
+
+	maxRetries := preInfo.ChunkRetry
+	if maxRetries <= 0 {
+		maxRetries = 5
+	}
+	retryDelay := time.Duration(preInfo.ChunkRetryDelay) * time.Second
+	if retryDelay <= 0 {
+		retryDelay = 2 * time.Second
+	}
+
+	err = retryFuncWithPolicy(maxRetries, retryDelay, func() error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		baseUploaded := atomic.LoadInt64(uploadedBytes)
+		body := &uploadProgressReader{
+			reader: bytes.NewReader(chunkData),
+			onRead: func(readBytes int64) {
+				uc.reportUploadProgress(baseUploaded+readBytes, fileSize, chunkIndex+1, chunksNum)
+			},
+		}
+		req, err := http.NewRequestWithContext(ctx, "PUT", uploadURL+"?"+params.Encode(), body)
+		if err != nil {
+			return fmt.Errorf("failed to create request: %v", err)
+		}
+		req.ContentLength = int64(len(chunkData))
+
+		req.Header.Set("X-Upos-Auth", preInfo.Auth)
+		req.Header.Set("Content-Length", strconv.Itoa(len(chunkData)))
+		req.Header.Set("User-Agent", uc.client.userAgent)
+		req.Header.Set("Connection", "keep-alive")
+
+		resp, err := uc.uploadClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("network error uploading chunk %d: %v", chunkIndex+1, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("upload chunk %d failed with status %s: %s", chunkIndex+1, resp.Status, string(bodyBytes))
+		}
+
+		currentUploaded := atomic.AddInt64(uploadedBytes, int64(len(chunkData)))
+		uc.reportUploadProgress(currentUploaded, fileSize, chunkIndex+1, chunksNum)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"partNumber": chunkIndex + 1,
+		"eTag":       "etag",
+	}, nil
 }
 
 // uploadChunksFromURL 从URL流式分块上传文件到 Bilibili
@@ -388,6 +481,10 @@ func (uc *UploadClient) completeUpload(preInfo *PreUploadInfo, uploadID string, 
 	params.Set("output", "json")
 	params.Set("profile", "ugcupos/bup")
 
+	sort.Slice(parts, func(i, j int) bool {
+		return partNumber(parts[i]) < partNumber(parts[j])
+	})
+
 	requestBody := map[string]interface{}{
 		"parts": parts,
 	}
@@ -451,4 +548,25 @@ func (uc *UploadClient) completeUpload(preInfo *PreUploadInfo, uploadID string, 
 		Filename: fileNameWithoutExt,
 		Desc:     "",
 	}, nil
+}
+
+func partNumber(part map[string]interface{}) int {
+	value, ok := part["partNumber"]
+	if !ok {
+		return 0
+	}
+
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return int(n)
+	default:
+		return 0
+	}
 }

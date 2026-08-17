@@ -49,6 +49,14 @@ func (s *TaskStepService) InitTaskSteps(videoID string) error {
 			return err
 		}
 		if count > 0 {
+			if err := s.DB.Model(&model.TaskStep{}).
+				Where("video_id = ? AND step_name = ?", videoID, step.Name).
+				Updates(map[string]interface{}{
+					"step_order": step.Order,
+					"can_retry":  step.CanRetry,
+				}).Error; err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -189,13 +197,19 @@ func (s *TaskStepService) UpdateTaskStepProgress(videoID, stepName string, perce
 	percent = clampProgressPercent(percent)
 	updates := map[string]interface{}{
 		"progress": percent,
+		// A progress callback is authoritative evidence that this step is active.
+		"status":     model.TaskStepStatusRunning,
+		"start_time": gorm.Expr("COALESCE(start_time, ?)", time.Now()),
+		"end_time":   nil,
+		"error_msg":  "",
 	}
 	if message != "" {
 		updates["progress_msg"] = message
 	}
 
 	return s.DB.Model(&model.TaskStep{}).
-		Where("video_id = ? AND step_name = ?", videoID, stepName).
+		Where("video_id = ? AND step_name = ? AND status IN ?", videoID, stepName,
+			[]string{model.TaskStepStatusPending, model.TaskStepStatusRunning}).
 		Updates(updates).Error
 }
 
@@ -323,35 +337,34 @@ func (s *TaskStepService) ResetAllRunningTasks() error {
 
 	taskStepsAffected := result.RowsAffected
 
-	videoResult := tx.Model(&model.SavedVideo{}).
-		Where("status = ?", "002").
-		Update("status", "001")
-
-	if videoResult.Error != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to reset running video status: %v", videoResult.Error)
-	}
-
-	videosAffected := videoResult.RowsAffected
-
 	// 提交事务
 	if err := tx.Commit().Error; err != nil {
 		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
-	log.Printf("Reset %d running task steps and %d videos (from processing to pending status)", taskStepsAffected, videosAffected)
+	log.Printf("Reset %d running task steps to pending status", taskStepsAffected)
 	return nil
 }
 
 // GetPendingSteps 获取所有状态为pending的任务步骤
 func (s *TaskStepService) GetPendingSteps() ([]*model.TaskStep, error) {
 	var candidates []*model.TaskStep
+	preparationSteps := []string{
+		"下载视频",
+		"分离音频",
+		"Whisper转录",
+		"B站必剪转录",
+		"生成字幕",
+		"下载封面",
+		"翻译字幕",
+		"生成元数据",
+	}
 
 	result := s.DB.Table("tb_task_steps").
 		Select("tb_task_steps.*").
 		Joins("INNER JOIN tb_saved_videos ON tb_task_steps.video_id = tb_saved_videos.video_id").
 		Where("tb_task_steps.status = ?", model.TaskStepStatusPending).
-		Where("tb_task_steps.step_order <= ?", 4).
+		Where("tb_task_steps.step_name IN ?", preparationSteps).
 		Where("tb_task_steps.deleted_at IS NULL").
 		Where("tb_saved_videos.deleted_at IS NULL").
 		Where("tb_saved_videos.status IN ?", []string{"002", "999"}).

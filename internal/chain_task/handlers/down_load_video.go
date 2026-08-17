@@ -42,6 +42,7 @@ const (
 	downloadOverallTimeout = 4 * time.Hour
 	downloadIdleTimeout    = 10 * time.Minute
 	metadataTimeout        = 2 * time.Minute
+	ytDlpMaxAge            = 60 * 24 * time.Hour
 )
 
 var ytDlpProgressPattern = regexp.MustCompile(`\[download\]\s+([0-9]+(?:\.[0-9]+)?)%`)
@@ -110,6 +111,9 @@ func (t *DownloadVideo) findYtDlp() (string, error) {
 
 	// 检查是否已安装
 	if manager.IsInstalled() {
+		if err := manager.CheckAndUpdateIfStale(ytDlpMaxAge); err != nil {
+			t.App.Logger.Warnf("⚠️ %v，将继续使用当前 yt-dlp", err)
+		}
 		path := manager.GetBinaryPath()
 		t.App.Logger.Debugf("找到 yt-dlp: %s", path)
 		return path, nil
@@ -141,6 +145,20 @@ func (t *DownloadVideo) findAria2() (string, bool) {
 
 // findLatestCookiesFile 查找最新的 cookies 文件
 func (t *DownloadVideo) findLatestCookiesFile() string {
+	if t.App.Config != nil && t.App.Config.Download.CookiesPath != "" {
+		cookiesPath := t.App.Config.Download.CookiesPath
+		if !filepath.IsAbs(cookiesPath) {
+			if absPath, err := filepath.Abs(cookiesPath); err == nil {
+				cookiesPath = absPath
+			}
+		}
+		if _, err := os.Stat(cookiesPath); err == nil {
+			t.App.Logger.Infof("🍪 找到配置的 cookies 文件: %s", cookiesPath)
+			return cookiesPath
+		}
+		t.App.Logger.Warnf("⚠️ 配置的 cookies 文件不存在: %s", cookiesPath)
+	}
+
 	// 1. 优先查找 data/cookies/ 目录下最新的用户提交的 cookies
 	cookiesDir := filepath.Join(t.App.Config.DataPath, "cookies")
 
@@ -214,6 +232,41 @@ func (t *DownloadVideo) findLatestCookiesFile() string {
 	return ""
 }
 
+func (t *DownloadVideo) appendCookieArgs(args []string) ([]string, bool) {
+	cookiesPath := t.findLatestCookiesFile()
+	if cookiesPath != "" {
+		t.App.Logger.Infof("🍪 使用 Cookies 文件: %s", cookiesPath)
+		return append(args, "--cookies", cookiesPath), true
+	}
+
+	if t.App.Config != nil && t.App.Config.Download.CookiesFromBrowser != "" {
+		browser := t.App.Config.Download.CookiesFromBrowser
+		t.App.Logger.Infof("🍪 未找到 cookies 文件，尝试从浏览器读取 Cookies: %s", browser)
+		return append(args, "--cookies-from-browser", browser), true
+	}
+
+	return args, false
+}
+
+func appendYtDlpJSRuntimeArgs(args []string) []string {
+	if denoPath, err := exec.LookPath("deno"); err == nil {
+		return append(args, "--js-runtimes", "deno:"+denoPath)
+	}
+
+	if homeDir, err := os.UserHomeDir(); err == nil {
+		denoPath := filepath.Join(homeDir, ".deno", "bin", "deno")
+		if info, statErr := os.Stat(denoPath); statErr == nil && !info.IsDir() {
+			return append(args, "--js-runtimes", "deno:"+denoPath)
+		}
+	}
+
+	if _, err := exec.LookPath("node"); err == nil {
+		return append(args, "--js-runtimes", "node")
+	}
+
+	return args
+}
+
 // getVideoURL 根据 VideoID 构建完整的视频 URL
 func (t *DownloadVideo) getVideoURL() string {
 	videoID := t.StateManager.VideoID
@@ -282,6 +335,21 @@ func (t *DownloadVideo) Execute(context map[string]interface{}) bool {
 
 // executeDownload 执行实际的下载操作
 func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy bool, context map[string]interface{}) bool {
+	if t.executeDownloadAttempt(ytdlpPath, videoURL, useProxy, true, context) {
+		return true
+	}
+
+	errMsg, _ := context["error"].(string)
+	if shouldRetryDownloadWithoutCookies(errMsg) {
+		t.App.Logger.Warn("⚠️ Cookies 可能导致 YouTube 只返回图片格式，尝试不使用 Cookies 重试...")
+		delete(context, "error")
+		return t.executeDownloadAttempt(ytdlpPath, videoURL, useProxy, false, context)
+	}
+
+	return false
+}
+
+func (t *DownloadVideo) executeDownloadAttempt(ytdlpPath, videoURL string, useProxy bool, useCookies bool, context map[string]interface{}) bool {
 	// 构建下载命令
 	command := []string{
 		ytdlpPath,
@@ -292,11 +360,12 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 		"--socket-timeout", "30",
 		"--retries", "3",
 		"--fragment-retries", "3",
+		"--write-info-json",
+		"--write-thumbnail",
+		"--convert-thumbnails", "jpg",
 	}
 
-	if _, err := exec.LookPath("node"); err == nil {
-		command = append(command, "--js-runtimes", "node")
-	}
+	command = appendYtDlpJSRuntimeArgs(command)
 
 	if aria2Path, ok := t.findAria2(); ok {
 		aria2Args := t.App.Config.Download.Aria2Args
@@ -310,12 +379,10 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 		t.App.Logger.Infof("🚀 使用 aria2c 加速下载: %s (%s)", aria2Path, aria2Args)
 	}
 
-	// 查找最新的 cookies 文件（优先使用用户提交的）
-	cookiesPath := t.findLatestCookiesFile()
-
-	if cookiesPath != "" {
-		command = append(command, "--cookies", cookiesPath)
-		t.App.Logger.Infof("🍪 使用 Cookies 文件: %s", cookiesPath)
+	if useCookies {
+		command, _ = t.appendCookieArgs(command)
+	} else {
+		t.App.Logger.Info("🍪 本次下载不使用 Cookies")
 	}
 
 	// 添加代理配置（如果需要）
@@ -396,6 +463,18 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 	context["downloaded_file"] = downloadedFile
 	t.App.Logger.Infof("✓ 视频下载成功: %s", downloadedFile)
 
+	// 所有进入后续准备阶段的视频都必须具备统一封面。
+	types.ReportTaskProgress(context, 93, "准备视频封面")
+	coverPath, err := t.ensureVideoCover(downloadedFile)
+	if err != nil {
+		errMsg := fmt.Sprintf("视频已下载，但封面准备失败: %v", err)
+		t.App.Logger.Errorf("❌ %s", errMsg)
+		context["error"] = errMsg
+		return false
+	}
+	context["cover_image_path"] = coverPath
+	t.App.Logger.Infof("✓ 视频封面已准备: %s", coverPath)
+
 	// 12. 获取视频元数据（标题、描述等）
 	t.App.Logger.Info("📋 获取视频元数据...")
 	types.ReportTaskProgress(context, 95, "获取视频元数据")
@@ -429,6 +508,72 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 	types.ReportTaskProgress(context, 98, "下载步骤收尾")
 
 	return true
+}
+
+func (t *DownloadVideo) ensureVideoCover(downloadedFile string) (string, error) {
+	videoDir := filepath.Dir(downloadedFile)
+	coverPath := filepath.Join(videoDir, "cover.jpg")
+	if info, err := os.Stat(coverPath); err == nil && !info.IsDir() && info.Size() > 0 {
+		return coverPath, nil
+	}
+
+	for _, extension := range []string{".jpg", ".jpeg", ".png", ".webp"} {
+		sourcePath := filepath.Join(videoDir, t.StateManager.VideoID+extension)
+		if info, err := os.Stat(sourcePath); err == nil && !info.IsDir() && info.Size() > 0 {
+			if err := copyFile(sourcePath, coverPath); err == nil {
+				return coverPath, nil
+			}
+		}
+	}
+
+	proxyURL := ""
+	if t.App.Config != nil && t.App.Config.ProxyConfig != nil && t.App.Config.ProxyConfig.UseProxy {
+		proxyURL = t.App.Config.ProxyConfig.ProxyHost
+	}
+	result := utils.DownloadYouTubeThumbnail(t.StateManager.VideoID, "best", utils.DownloadOptions{
+		SavePath: videoDir, Timeout: 20 * time.Second, MaxRetries: 3,
+		QualityFallback: true, CreateDirs: true, Overwrite: true, ProxyURL: proxyURL,
+	}, "cover")
+	if thumbnail, ok := result.(utils.DownloadResult); ok && thumbnail.Success {
+		return thumbnail.FilePath, nil
+	}
+
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return "", fmt.Errorf("无法下载源封面，且未找到 ffmpeg 进行视频截帧")
+	}
+	cmd := exec.Command(ffmpegPath, "-y", "-ss", "00:00:03", "-i", downloadedFile,
+		"-frames:v", "1", "-q:v", "2", coverPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("下载源封面及视频截帧均失败: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if info, err := os.Stat(coverPath); err != nil || info.IsDir() || info.Size() == 0 {
+		return "", fmt.Errorf("视频截帧命令完成但未生成有效封面")
+	}
+	return coverPath, nil
+}
+
+func copyFile(sourcePath, targetPath string) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	target, err := os.Create(targetPath)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(target, source); err != nil {
+		target.Close()
+		return err
+	}
+	return target.Close()
+}
+func shouldRetryDownloadWithoutCookies(errMsg string) bool {
+	errMsg = strings.ToLower(errMsg)
+	return strings.Contains(errMsg, "n challenge solving failed") ||
+		strings.Contains(errMsg, "only images are available") ||
+		strings.Contains(errMsg, "requested format is not available")
 }
 
 func (t *DownloadVideo) waitForDownload(cmd *exec.Cmd, cmdCtx stdctx.Context, activityCh <-chan struct{}) error {
@@ -683,19 +828,9 @@ func (t *DownloadVideo) getVideoMetadata(ytdlpPath string) (*VideoMetadataInfo, 
 
 	// 构建基础命令参数
 	baseArgs := []string{"--dump-json", "--no-download"}
-	if _, err := exec.LookPath("node"); err == nil {
-		baseArgs = append(baseArgs, "--js-runtimes", "node")
-	}
+	baseArgs = appendYtDlpJSRuntimeArgs(baseArgs)
 
-	// 添加 cookies 支持（使用最新的用户提交的 cookies）
-	cookiesPath := t.findLatestCookiesFile()
-
-	if cookiesPath != "" {
-		baseArgs = append(baseArgs, "--cookies", cookiesPath)
-		t.App.Logger.Debugf("🍪 使用 Cookies 文件获取元数据: %s", cookiesPath)
-	} else {
-		t.App.Logger.Debug("No cookies file found; fetching metadata without cookies")
-	}
+	baseArgs, _ = t.appendCookieArgs(baseArgs)
 
 	// 尝试使用代理
 	useProxy := t.App.Config != nil && t.App.Config.ProxyConfig != nil &&
@@ -729,6 +864,9 @@ func (t *DownloadVideo) getVideoMetadata(ytdlpPath string) (*VideoMetadataInfo, 
 	var metadata VideoMetadataInfo
 	if err := json.Unmarshal(output, &metadata); err != nil {
 		return nil, fmt.Errorf("解析元数据失败: %v", err)
+	}
+	if strings.TrimSpace(metadata.Title) == "" {
+		return nil, fmt.Errorf("获取元数据失败: yt-dlp 未返回视频标题")
 	}
 
 	return &metadata, nil

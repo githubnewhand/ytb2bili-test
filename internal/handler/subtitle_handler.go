@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/difyz9/ytb2bili/internal/core"
+	"github.com/difyz9/ytb2bili/internal/core/services"
 	authpkg "github.com/difyz9/ytb2bili/pkg/auth"
 	"github.com/difyz9/ytb2bili/pkg/store/model"
 	"github.com/difyz9/ytb2bili/pkg/utils"
@@ -19,25 +20,30 @@ import (
 
 type SubtitleHandler struct {
 	BaseHandler
+	ChargeCompilationService *services.ChargeCompilationService
 }
 
-func NewSubtitleHandler(app *core.AppServer) *SubtitleHandler {
+func NewSubtitleHandler(app *core.AppServer, chargeCompilationService *services.ChargeCompilationService) *SubtitleHandler {
 
 	return &SubtitleHandler{
-		BaseHandler: BaseHandler{App: app},
+		BaseHandler:              BaseHandler{App: app},
+		ChargeCompilationService: chargeCompilationService,
 	}
 }
 
 // SaveVideoRequest 保存视频请求
 type SaveVideoRequest struct {
-	URL           string                     `json:"url" binding:"required"`
-	Title         string                     `json:"title"`
-	Description   string                     `json:"description"`
-	OperationType string                     `json:"operationType"`
-	Subtitles     []model.SavedVideoSubtitle `json:"subtitles"`
-	PlaylistID    string                     `json:"playlistId"`
-	Timestamp     string                     `json:"timestamp"`
-	SavedAt       string                     `json:"savedAt"`
+	URL             string                     `json:"url" binding:"required"`
+	Title           string                     `json:"title"`
+	Description     string                     `json:"description"`
+	OperationType   string                     `json:"operationType"`
+	Subtitles       []model.SavedVideoSubtitle `json:"subtitles"`
+	PlaylistID      string                     `json:"playlistId"`
+	Timestamp       string                     `json:"timestamp"`
+	SavedAt         string                     `json:"savedAt"`
+	PublishAudience string                     `json:"publish_audience"`
+	PreviewSeconds  int                        `json:"preview_seconds"`
+	RightsVerified  bool                       `json:"rights_verified"`
 }
 
 func (h *SubtitleHandler) saveVideoSubtitles(c *gin.Context) {
@@ -156,6 +162,20 @@ func (h *SubtitleHandler) saveVideoSubtitles(c *gin.Context) {
 		return
 	}
 
+	if req.PublishAudience != "" {
+		classified, classifyErr := h.ChargeCompilationService.ClassifyVideo(
+			savedVideo.VideoID,
+			req.PublishAudience,
+			req.PreviewSeconds,
+			req.RightsVerified,
+		)
+		if classifyErr != nil {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "code": 409, "message": classifyErr.Error()})
+			return
+		}
+		savedVideo = classified
+	}
+
 	// 计算字幕数量
 	subtitleCount := len(req.Subtitles)
 
@@ -166,6 +186,7 @@ func (h *SubtitleHandler) saveVideoSubtitles(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
+		"code":    200,
 		"message": message,
 		"data": gin.H{
 			"id":            savedVideo.ID,

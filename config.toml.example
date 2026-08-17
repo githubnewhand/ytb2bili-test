@@ -16,7 +16,7 @@ FileUpDir = "/Users/apple/opt/file_upload/media"  # 文件上传目录（绝对�
   host = "localhost"          # 数据库主机
   port = 3306                 # 数据库端口
   username = "root"           # 数据库用户名
-  password = "Ab123456"       # 数据库密码
+  password = "your-database-password" # 数据库密码
   database = "bili_up"        # 数据库名称
   ssl_mode = "disable"        # SSL 模式
   timezone = "Asia/Shanghai"  # 时区
@@ -33,15 +33,34 @@ FileUpDir = "/Users/apple/opt/file_upload/media"  # 文件上传目录（绝对�
 # 任务调度配置
 # ======================
 [task]
-  max_concurrent_prepare = 2  # 准备阶段最大并发数：下载/分离音频/转写/翻译/生成元数据
+  max_concurrent_prepare = 4  # 准备阶段最大并发数：下载/分离音频/转写/翻译/生成元数据
+
+# ======================
+# 充电视频素材池与拼接
+# ======================
+[charge_compilation]
+  enabled = true
+  min_items = 3
+  max_items = 4
+  target_width = 1920
+  target_height = 1080
+  target_fps = 30
+  video_crf = 23
+  video_preset = "veryfast"
+  audio_bitrate = "192k"
+  default_preview_seconds = 180
+  free_auto_upload_delay_minutes = 60
+  charge_upload_policy = "immediate" # immediate / manual
 
 # ======================
 # 下载配置
 # ======================
 [download]
-  use_aria2 = false
+  use_aria2 = true
   aria2_path = ""  # 留空则从 PATH 查找 aria2c
   aria2_args = "-x 16 -s 16 -k 1M --file-allocation=none"
+  cookies_path = ""              # 可填手动导出的 YouTube cookies.txt 路径
+  cookies_from_browser = ""      # 可填 chrome/edge/firefox；没有 cookies 文件时从浏览器读取登录态
 
 # ======================
 # 腾讯云 COS 存储配置
