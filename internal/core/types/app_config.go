@@ -10,19 +10,20 @@ import (
 
 // AppConfig 应用程序配置
 type AppConfig struct {
-	Path        string         `toml:"-"`
-	Listen      string         `toml:"listen"`
-	Environment string         `toml:"environment"`
-	Debug       bool           `toml:"debug"`
-	Database    Database       `toml:"database"`
-	Auth        AuthConfig     `toml:"auth"`
-	AppAuth     AppAuthConfig  `toml:"app_auth"` // 应用启动认证配置
-	APIAuth     APIAuthConfig  `toml:"api_auth"` // API请求认证配置（go-auth）
-	TaskConfig  TaskConfig     `toml:"task"`     // 任务调度配置
-	Download    DownloadConfig `toml:"download"` // 下载配置
-	FileUpDir   string         `toml:"fileUpDir"`
-	DataPath    string         `toml:"data_path"`   // 数据存储路径（用于 cookies 等）
-	YtDlpPath   string         `toml:"yt_dlp_path"` // yt-dlp 安装路径
+	Path              string                  `toml:"-"`
+	Listen            string                  `toml:"listen"`
+	Environment       string                  `toml:"environment"`
+	Debug             bool                    `toml:"debug"`
+	Database          Database                `toml:"database"`
+	Auth              AuthConfig              `toml:"auth"`
+	AppAuth           AppAuthConfig           `toml:"app_auth"` // 应用启动认证配置
+	APIAuth           APIAuthConfig           `toml:"api_auth"` // API请求认证配置（go-auth）
+	TaskConfig        TaskConfig              `toml:"task"`     // 任务调度配置
+	Download          DownloadConfig          `toml:"download"` // 下载配置
+	ChargeCompilation ChargeCompilationConfig `toml:"charge_compilation"`
+	FileUpDir         string                  `toml:"fileUpDir"`
+	DataPath          string                  `toml:"data_path"`   // 数据存储路径（用于 cookies 等）
+	YtDlpPath         string                  `toml:"yt_dlp_path"` // yt-dlp 安装路径
 
 	PrimaryAIService       string                  `toml:"primary_ai_service"`     // 首选AI服务提供商
 	TenCosConfig           *TencentCosConfig       `toml:"TenCosConfig"`           // 腾讯云 COS 存储配置
@@ -110,11 +111,29 @@ type TaskConfig struct {
 	MaxConcurrentPrepare int `toml:"max_concurrent_prepare"` // 准备阶段最大并发数（下载/转写/翻译/元数据）
 }
 
+// ChargeCompilationConfig controls charge-only source pooling and compilation.
+type ChargeCompilationConfig struct {
+	Enabled                    bool   `toml:"enabled"`
+	MinItems                   int    `toml:"min_items"`
+	MaxItems                   int    `toml:"max_items"`
+	TargetWidth                int    `toml:"target_width"`
+	TargetHeight               int    `toml:"target_height"`
+	TargetFPS                  int    `toml:"target_fps"`
+	VideoCRF                   int    `toml:"video_crf"`
+	VideoPreset                string `toml:"video_preset"`
+	AudioBitrate               string `toml:"audio_bitrate"`
+	DefaultPreviewSeconds      int    `toml:"default_preview_seconds"`
+	FreeAutoUploadDelayMinutes int    `toml:"free_auto_upload_delay_minutes"`
+	ChargeUploadPolicy         string `toml:"charge_upload_policy"`
+}
+
 // DownloadConfig 下载配置
 type DownloadConfig struct {
-	UseAria2  bool   `toml:"use_aria2"`  // yt-dlp 下载视频时是否调用 aria2c
-	Aria2Path string `toml:"aria2_path"` // aria2c 可执行文件路径，留空则从 PATH 查找
-	Aria2Args string `toml:"aria2_args"` // 传给 aria2c 的参数
+	UseAria2           bool   `toml:"use_aria2"`            // yt-dlp 下载视频时是否调用 aria2c
+	Aria2Path          string `toml:"aria2_path"`           // aria2c 可执行文件路径，留空则从 PATH 查找
+	Aria2Args          string `toml:"aria2_args"`           // 传给 aria2c 的参数
+	CookiesPath        string `toml:"cookies_path"`         // YouTube cookies.txt 路径，留空则自动查找
+	CookiesFromBrowser string `toml:"cookies_from_browser"` // 直接读取浏览器 cookies，例如 chrome、edge、firefox
 }
 
 // GetDSN 获取数据库连接字符串
@@ -260,9 +279,25 @@ func NewDefaultConfig() *AppConfig {
 			MaxConcurrentPrepare: 2,
 		},
 		Download: DownloadConfig{
-			UseAria2:  false,
-			Aria2Path: "",
-			Aria2Args: "-x 16 -s 16 -k 1M --file-allocation=none",
+			UseAria2:           false,
+			Aria2Path:          "",
+			Aria2Args:          "-x 16 -s 16 -k 1M --file-allocation=none",
+			CookiesPath:        "",
+			CookiesFromBrowser: "",
+		},
+		ChargeCompilation: ChargeCompilationConfig{
+			Enabled:                    true,
+			MinItems:                   3,
+			MaxItems:                   4,
+			TargetWidth:                1920,
+			TargetHeight:               1080,
+			TargetFPS:                  30,
+			VideoCRF:                   23,
+			VideoPreset:                "veryfast",
+			AudioBitrate:               "192k",
+			DefaultPreviewSeconds:      180,
+			FreeAutoUploadDelayMinutes: 60,
+			ChargeUploadPolicy:         "immediate",
 		},
 
 		// 首选AI服务提供商（空表示自动选择）
@@ -371,6 +406,7 @@ func LoadConfig(configFile string) (*AppConfig, error) {
 		APIAuth                APIAuthConfig           `toml:"api_auth"`
 		TaskConfig             TaskConfig              `toml:"task"`
 		Download               DownloadConfig          `toml:"download"`
+		ChargeCompilation      ChargeCompilationConfig `toml:"charge_compilation"`
 		FileUpDir              string                  `toml:"fileUpDir"`
 		DataPath               string                  `toml:"data_path"`
 		YtDlpPath              string                  `toml:"yt_dlp_path"`
@@ -426,6 +462,9 @@ func LoadConfig(configFile string) (*AppConfig, error) {
 		if fileConfig.Download.Aria2Args != "" {
 			config.Download.Aria2Args = fileConfig.Download.Aria2Args
 		}
+	}
+	if fileConfig.ChargeCompilation.MinItems > 0 {
+		config.ChargeCompilation = fileConfig.ChargeCompilation
 	}
 
 	if fileConfig.TenCosConfig != nil {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,6 +27,8 @@ const (
 	APIQueryResult  = APIBaseURL + "/task/result"
 )
 
+var bcutUploadSemaphore = make(chan struct{}, 1)
+
 // BcutHandler B站必剪语音转录处理器
 type BcutHandler struct {
 	base.BaseTask
@@ -34,13 +37,15 @@ type BcutHandler struct {
 	Language string // 语言代码，如 "zh", "en"
 
 	// 上传相关状态
-	uploadID   string
-	uploadURLs []string
-	perSize    int
-	clips      int
-	inBossKey  string
-	etags      []string
-	taskID     string
+	uploadID    string
+	uploadURLs  []string
+	perSize     int
+	clips       int
+	inBossKey   string
+	resourceID  string
+	downloadURL string
+	etags       []string
+	taskID      string
 }
 
 // NewBcutHandler 创建B站必剪转录处理器
@@ -93,40 +98,38 @@ func (h *BcutHandler) Execute(context map[string]interface{}) bool {
 
 	// 1. 申请上传
 	types.ReportTaskProgress(context, 15, "申请转录上传")
-	if err := h.requestUpload(len(fileData)); err != nil {
+	if err := h.requestUpload(len(fileData), audioPath); err != nil {
 		fmt.Printf("❌ 申请上传失败: %v\n", err)
-		context["error"] = fmt.Sprintf("申请上传失败: %v", err)
-		return false
+		return h.runLocalWhisperFallback(context, fmt.Errorf("申请上传失败: %w", err))
 	}
 
 	// 2. 上传音频文件
 	if err := h.uploadParts(fileData, context); err != nil {
 		fmt.Printf("❌ 上传音频失败: %v\n", err)
-		context["error"] = fmt.Sprintf("上传音频失败: %v", err)
-		return false
+		return h.runLocalWhisperFallback(context, fmt.Errorf("上传音频失败: %w", err))
 	}
 
 	// 3. 提交上传
 	types.ReportTaskProgress(context, 50, "提交音频上传")
 	if err := h.commitUpload(); err != nil {
 		fmt.Printf("❌ 提交上传失败: %v\n", err)
-		context["error"] = fmt.Sprintf("提交上传失败: %v", err)
-		return false
+		return h.runLocalWhisperFallback(context, fmt.Errorf("提交上传失败: %w", err))
 	}
 
 	// 4. 创建转录任务
 	types.ReportTaskProgress(context, 55, "创建转录任务")
 	if err := h.createTask(); err != nil {
 		fmt.Printf("❌ 创建任务失败: %v\n", err)
-		context["error"] = fmt.Sprintf("创建任务失败: %v", err)
-		return false
+		return h.runLocalWhisperFallback(context, fmt.Errorf("创建任务失败: %w", err))
 	}
 
 	// 5. 轮询查询结果
 	result, err := h.queryResultWithRetry(60, 3*time.Second, context)
 	if err != nil {
 		fmt.Printf("❌ 查询结果失败: %v\n", err)
-		context["error"] = fmt.Sprintf("查询结果失败: %v", err)
+		if h.runLocalWhisperFallback(context, err) {
+			return true
+		}
 		return false
 	}
 
@@ -143,14 +146,47 @@ func (h *BcutHandler) Execute(context map[string]interface{}) bool {
 	return true
 }
 
+func (h *BcutHandler) runLocalWhisperFallback(context map[string]interface{}, bcutErr error) bool {
+	config := h.App.Config.WhisperConfig
+	if config == nil || config.ModelPath == "" {
+		context["error"] = fmt.Sprintf("必剪转录失败: %v；本地 Whisper 未配置", bcutErr)
+		return false
+	}
+
+	types.ReportTaskProgress(context, 60, "必剪失败，转用本地 Whisper")
+	h.App.Logger.Warnf("必剪转录失败，降级使用本地 Whisper: %v", bcutErr)
+
+	fallback := NewWhisperHandler(
+		"B站必剪转录",
+		h.App,
+		h.StateManager,
+		h.Client,
+		config.ModelPath,
+		config.Language,
+		config.Threads,
+	)
+	if fallback.Execute(context) {
+		delete(context, "error")
+		return true
+	}
+
+	localErr := context["error"]
+	context["error"] = fmt.Sprintf("必剪转录失败: %v；本地 Whisper 失败: %v", bcutErr, localErr)
+	return false
+}
+
 // requestUpload 申请上传
-func (h *BcutHandler) requestUpload(fileSize int) error {
+func (h *BcutHandler) requestUpload(fileSize int, audioPath string) error {
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(audioPath)), ".")
+	if ext == "" {
+		ext = "wav"
+	}
 	payload := map[string]interface{}{
-		"type":        2,
-		"name":        "audio.wav",
-		"size":        fileSize,
-		"resource_id": 0,
-		"model_id":    7,
+		"type":             2,
+		"name":             "audio." + ext,
+		"size":             fileSize,
+		"ResourceFileType": ext,
+		"model_id":         "8",
 	}
 
 	respData, err := h.makeRequest("POST", APIReqUpload, payload)
@@ -161,6 +197,7 @@ func (h *BcutHandler) requestUpload(fileSize int) error {
 	data := respData["data"].(map[string]interface{})
 	h.uploadID = data["upload_id"].(string)
 	h.inBossKey = data["in_boss_key"].(string)
+	h.resourceID = fmt.Sprintf("%v", data["resource_id"])
 	h.perSize = int(data["per_size"].(float64))
 
 	uploadURLs := data["upload_urls"].([]interface{})
@@ -179,6 +216,8 @@ func (h *BcutHandler) requestUpload(fileSize int) error {
 
 // uploadParts 上传音频分片
 func (h *BcutHandler) uploadParts(fileData []byte, context map[string]interface{}) error {
+	bcutUploadSemaphore <- struct{}{}
+	defer func() { <-bcutUploadSemaphore }()
 	for i := 0; i < h.clips; i++ {
 		start := i * h.perSize
 		end := start + h.perSize
@@ -221,24 +260,25 @@ func (h *BcutHandler) uploadParts(fileData []byte, context map[string]interface{
 
 // commitUpload 提交上传
 func (h *BcutHandler) commitUpload() error {
-	parts := make([]map[string]interface{}, len(h.etags))
-	for i, etag := range h.etags {
-		parts[i] = map[string]interface{}{
-			"part_number": i + 1,
-			"etag":        etag,
-		}
-	}
-
 	payload := map[string]interface{}{
-		"in_boss_key": h.inBossKey,
-		"upload_id":   h.uploadID,
-		"model_id":    7,
-		"parts":       parts,
+		"InBossKey":  h.inBossKey,
+		"ResourceId": h.resourceID,
+		"Etags":      strings.Join(h.etags, ","),
+		"UploadId":   h.uploadID,
+		"model_id":   "8",
 	}
 
-	_, err := h.makeRequest("POST", APICommitUpload, payload)
+	respData, err := h.makeRequest("POST", APICommitUpload, payload)
 	if err != nil {
 		return err
+	}
+	data, ok := respData["data"].(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("commit upload response missing data")
+	}
+	h.downloadURL, _ = data["download_url"].(string)
+	if h.downloadURL == "" {
+		return fmt.Errorf("commit upload response missing download_url")
 	}
 
 	fmt.Println("✅ 上传提交成功")
@@ -248,11 +288,7 @@ func (h *BcutHandler) commitUpload() error {
 // createTask 创建转录任务
 func (h *BcutHandler) createTask() error {
 	payload := map[string]interface{}{
-		"resource": map[string]interface{}{
-			"in_boss_key": h.inBossKey,
-			"upload_id":   h.uploadID,
-			"model_id":    7,
-		},
+		"resource": h.downloadURL,
 		"model_id": "8",
 	}
 
@@ -291,10 +327,17 @@ func (h *BcutHandler) queryResultWithRetry(maxRetries int, interval time.Duratio
 			return nil, err
 		}
 
-		status := int(result["status"].(float64))
+		statusValue, ok := result["state"].(float64)
+		if !ok {
+			statusValue, ok = result["status"].(float64)
+		}
+		if !ok {
+			return nil, fmt.Errorf("transcription response missing state/status")
+		}
+		status := int(statusValue)
 
 		switch status {
-		case 2: // 成功
+		case 2, 4: // 成功（兼容新旧响应）
 			fmt.Println("✅ 转录成功")
 			types.ReportTaskProgress(context, 90, "转录完成")
 			return result, nil
@@ -303,7 +346,7 @@ func (h *BcutHandler) queryResultWithRetry(maxRetries int, interval time.Duratio
 			if ec, ok := result["error_code"]; ok {
 				errorCode = fmt.Sprintf("%v", ec)
 			}
-			return nil, fmt.Errorf("转录任务失败，错误代码: %s", errorCode)
+			return nil, fmt.Errorf("转录任务失败，错误代码: %s，响应: %v", errorCode, result)
 		case 0, 1: // 处理中
 			fmt.Printf("⏳ 转录处理中... (%d/%d)\n", i+1, maxRetries)
 			progress := 60 + ((i + 1) * 30 / maxRetries)
@@ -389,7 +432,7 @@ func (h *BcutHandler) makeRequest(method, url string, payload interface{}) (map[
 
 	// 设置请求头
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("User-Agent", "Bilibili/1.0.0 (https://www.bilibili.com)")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)

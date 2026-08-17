@@ -1,6 +1,0 @@
-sh start_ytb2bili.sh直接在Ubuntu目录启动项目
-或wsl-ubuntu 执行cd ytb2bili-test
-explorer.exe .打开虚拟环境中的ytb2bili-test文件
-./bili-up-api-server启动项目
-make build-api修改代码后重新构建
-generate_subtitles字幕代码

@@ -12,5 +12,9 @@ func MigrateDatabase(db *gorm.DB) error {
 		&model.SavedVideo{},
 		&model.TaskStep{},
 		&model.AccountBinding{},
+		&model.ChargePoolItem{},
+		&model.CompilationBatch{},
+		&model.CompilationItem{},
+		&model.UploadJob{},
 	)
 }

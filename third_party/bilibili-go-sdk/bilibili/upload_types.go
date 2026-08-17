@@ -9,28 +9,40 @@ type Video struct {
 
 // Studio 投稿信息
 type Studio struct {
-	Copyright     int      `json:"copyright"`            // 是否转载, 1-自制 2-转载
-	Source        string   `json:"source"`               // 转载来源
-	Tid           int      `json:"tid"`                  // 投稿分区
-	Cover         string   `json:"cover"`                // 视频封面
-	Title         string   `json:"title"`                // 视频标题
-	DescFormatId  int      `json:"desc_format_id"`       // 简介格式ID
-	Desc          string   `json:"desc"`                 // 视频简介
-	Dynamic       string   `json:"dynamic"`              // 空间动态
-	Subtitle      Subtitle `json:"subtitle"`             // 字幕信息
-	Tag           string   `json:"tag"`                  // 视频标签
-	Videos        []Video  `json:"videos"`               // 视频文件列表
-	Dtime         *int64   `json:"dtime,omitempty"`      // 延时发布时间
-	OpenSubtitle  bool     `json:"open_subtitle"`        // 是否开启字幕
-	Interactive   int      `json:"interactive"`          // 是否开启互动
-	MissionId     *int     `json:"mission_id,omitempty"` // 任务ID
-	Dolby         int      `json:"dolby"`                // 是否开启杜比音效
-	LosslessMusic int      `json:"lossless_music"`       // 是否开启Hi-Res
-	NoReprint     int      `json:"no_reprint"`           // 是否禁止转载
-	OpenElec      int      `json:"open_elec"`            // 是否开启充电
+	Copyright         int            `json:"copyright"`                     // 是否转载, 1-自制 2-转载
+	Source            string         `json:"source"`                        // 转载来源
+	Tid               int            `json:"tid"`                           // 投稿分区
+	Cover             string         `json:"cover"`                         // 视频封面
+	Title             string         `json:"title"`                         // 视频标题
+	DescFormatId      int            `json:"desc_format_id"`                // 简介格式ID
+	Desc              string         `json:"desc"`                          // 视频简介
+	Dynamic           string         `json:"dynamic"`                       // 空间动态
+	Subtitle          Subtitle       `json:"subtitle"`                      // 字幕信息
+	Tag               string         `json:"tag"`                           // 视频标签
+	Videos            []Video        `json:"videos"`                        // 视频文件列表
+	Dtime             *int64         `json:"dtime,omitempty"`               // 延时发布时间
+	OpenSubtitle      bool           `json:"open_subtitle"`                 // 是否开启字幕
+	Interactive       int            `json:"interactive"`                   // 是否开启互动
+	MissionId         *int           `json:"mission_id,omitempty"`          // 任务ID
+	Dolby             int            `json:"dolby"`                         // 是否开启杜比音效
+	LosslessMusic     int            `json:"lossless_music"`                // 是否开启Hi-Res
+	NoReprint         int            `json:"no_reprint"`                    // 是否禁止转载
+	OpenElec          int            `json:"open_elec"`                     // 是否开启充电
+	IsUPowerExclusive int            `json:"is_upower_exclusive"`           // legacy compatibility field
+	ChargingPay       int            `json:"charging_pay,omitempty"`        // current web API switch for paid video
+	UPowerMode        int            `json:"upower_mode"`                   // 0=monthly UPower, 3=single-video payment
+	UPowerLevelID     string         `json:"upower_level_id,omitempty"`     // account-specific monthly tier ID
+	Preview           *UPowerPreview `json:"preview,omitempty"`             // current web API preview interval
+	UPowerLevel       int            `json:"upower_level,omitempty"`        // legacy compatibility field
+	UPowerPreviewTime int            `json:"upower_preview_time,omitempty"` // legacy compatibility field
 }
 
 // Subtitle 字幕信息
+type UPowerPreview struct {
+	NeedPreview int `json:"need_preview"`
+	StartTime   int `json:"start_time"`
+	EndTime     int `json:"end_time"`
+}
 type Subtitle struct {
 	Open int    `json:"open"`
 	Lan  string `json:"lan"`

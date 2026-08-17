@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"github.com/difyz9/ytb2bili/internal/chain_task"
 	"github.com/difyz9/ytb2bili/internal/core"
 	"github.com/difyz9/ytb2bili/internal/core/services"
@@ -12,7 +13,6 @@ import (
 	"github.com/difyz9/ytb2bili/pkg/logger"
 	"github.com/difyz9/ytb2bili/pkg/store"
 	"github.com/difyz9/ytb2bili/pkg/utils"
-	"context"
 	"github.com/gin-gonic/gin"
 	"github.com/robfig/cron/v3"
 	"go.uber.org/fx"
@@ -101,6 +101,7 @@ func main() {
 		fx.Provide(services.NewVideoService),
 		fx.Provide(services.NewSavedVideoService),
 		fx.Provide(services.NewTaskStepService),
+		fx.Provide(services.NewChargeCompilationService),
 
 		// 注册cron
 		fx.Provide(func() *cron.Cron {
@@ -123,6 +124,21 @@ func main() {
 			return store.MigrateDatabase(db)
 		}),
 
+		// 为升级前已处理完成的存量任务回填现成媒体路径，避免重新下载。
+		fx.Invoke(func(service *services.ChargeCompilationService, logger *zap.SugaredLogger) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			result, err := service.BackfillLegacyReadyMedia(ctx)
+			if err != nil {
+				logger.Errorf("存量已处理视频媒体路径回填失败: %v", err)
+				return
+			}
+			logger.Infof("存量已处理视频媒体路径回填完成: 扫描%d个，更新%d个", result.Scanned, result.Updated)
+			for _, problem := range result.Problems {
+				logger.Warnf("存量视频未回填: %s", problem)
+			}
+		}),
+
 		// 初始化并检查 yt-dlp
 		fx.Invoke(func(logger *zap.SugaredLogger, config *types.AppConfig) error {
 			logger.Info("Checking yt-dlp installation...")
@@ -133,6 +149,12 @@ func main() {
 		fx.Invoke(func(h *chain_task.ChainTaskHandler) {
 			// 设置并启动任务消费者（准备阶段：下载、字幕、翻译、元数据）
 			h.SetUp()
+		}),
+
+		// 添加充电视频拼接调度器
+		fx.Provide(chain_task.NewCompilationScheduler),
+		fx.Invoke(func(s *chain_task.CompilationScheduler) {
+			s.SetUp()
 		}),
 
 		// 添加上传调度器
@@ -149,6 +171,7 @@ func main() {
 			logger *zap.SugaredLogger,
 			savedVideoService *services.SavedVideoService,
 			taskStepService *services.TaskStepService,
+			chargeCompilationService *services.ChargeCompilationService,
 			uploadScheduler *chain_task.UploadScheduler,
 			analyticsMiddleware *analytics.Middleware,
 			analyticsClient *analytics.Client,
@@ -163,7 +186,7 @@ func main() {
 			}
 
 			// 注册所有 Handler 路由（包括连接 VideoHandler 和 UploadScheduler）
-			registerHandlers(server, logger, savedVideoService, taskStepService, uploadScheduler, analyticsClient)
+			registerHandlers(server, logger, savedVideoService, taskStepService, chargeCompilationService, uploadScheduler, analyticsClient)
 
 			// 健康检查
 			server.Engine.GET("/health", func(c *gin.Context) {
@@ -250,6 +273,7 @@ func registerHandlers(
 	logger *zap.SugaredLogger,
 	savedVideoService *services.SavedVideoService,
 	taskStepService *services.TaskStepService,
+	chargeCompilationService *services.ChargeCompilationService,
 	uploadScheduler *chain_task.UploadScheduler,
 	analyticsClient *analytics.Client,
 ) {
@@ -271,7 +295,7 @@ func registerHandlers(
 	logger.Info("✓ Category routes registered")
 
 	// 字幕 Handler
-	subtitleHandler := handler.NewSubtitleHandler(server)
+	subtitleHandler := handler.NewSubtitleHandler(server, chargeCompilationService)
 	subtitleHandler.RegisterRoutes(server)
 	logger.Info("✓ Subtitle routes registered")
 
@@ -279,13 +303,18 @@ func registerHandlers(
 	analyticsHandler := handler.NewAnalyticsHandler(analyticsClient, logger)
 
 	// 视频 Handler
-	videoHandler := handler.NewVideoHandler(server, savedVideoService, taskStepService)
+	videoHandler := handler.NewVideoHandler(server, savedVideoService, taskStepService, chargeCompilationService)
 	// 设置分析处理器
 	videoHandler.AnalyticsHandler = analyticsHandler
 	// 设置上传调度器（避免循环依赖）
 	videoHandler.SetUploadScheduler(uploadScheduler)
 	videoHandler.RegisterRoutes(server.Engine.Group("/api/v1"))
 	logger.Info("✓ Video routes registered")
+
+	// 充电素材池与拼接批次 Handler
+	chargeHandler := handler.NewChargeCompilationHandler(server, chargeCompilationService)
+	chargeHandler.RegisterRoutes(server.Engine.Group("/api/v1"))
+	logger.Info("✓ Charge compilation routes registered")
 
 	// 配置 Handler
 	configHandler := handler.NewConfigHandler(server)

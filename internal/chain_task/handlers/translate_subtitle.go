@@ -37,7 +37,7 @@ func NewTranslateSubtitle(name string, app *core.AppServer, stateManager *manage
 		App:        app,
 		DB:         db,
 		APIKey:     "", // 不再固化API Key，运行时动态获取
-		GroupSize:  15, // 每组15句，降低单次请求长度
+		GroupSize:  25, // 每组25句，降低单次请求长度
 		MaxWorkers: 5,  // worker可以较高，真实请求节奏由自适应限速器控制
 	}
 }
@@ -175,12 +175,17 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 	t.RateLimiter = newAdaptiveRateLimiter(800*time.Millisecond, 350*time.Millisecond, 6*time.Second)
 	types.ReportTaskProgress(context, 10, "读取字幕文件")
 
-	// 1. 检查英文字幕文件是否存在（由 GenerateSubtitles 任务生成）
-	enSRTPath := filepath.Join(t.StateManager.CurrentDir, fmt.Sprintf("%s.srt", t.StateManager.VideoID))
+	// 1. Prefer the canonical original subtitle path; keep the legacy video-ID name as fallback.
+	enSRTPath := t.StateManager.OriginalSRT
 	if _, err := os.Stat(enSRTPath); os.IsNotExist(err) {
-		t.App.Logger.Error("❌ 英文字幕文件不存在，无法翻译")
-		context["error"] = "翻译失败：缺少英文字幕文件，请先完成生成字幕"
-		return false
+		legacyPath := filepath.Join(t.StateManager.CurrentDir, fmt.Sprintf("%s.srt", t.StateManager.VideoID))
+		if _, legacyErr := os.Stat(legacyPath); legacyErr == nil {
+			enSRTPath = legacyPath
+		} else {
+			t.App.Logger.Error("Original subtitle file does not exist")
+			context["error"] = "Translation failed: original subtitle file is missing"
+			return false
+		}
 	}
 
 	// 2. 读取并解析英文字幕文件

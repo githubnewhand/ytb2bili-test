@@ -10,6 +10,8 @@ config.toml
 # IDE 文件
 .idea/
 .vscode/
+.agents/
+.codex*
 *.swp
 *.swo
 node_modules
@@ -17,6 +19,8 @@ node_modules
 # 系统文件
 .DS_Store
 Thumbs.db
+*:Zone.Identifier
+*：Zone.Identifier
 
 # 日志文件
 logs/
@@ -24,10 +28,12 @@ logs/
 
 # 构建产物
 ytb2bili-*
-bili-up-api-server
+bili-up-api-server*
 bili_up_backend
 dist/
 build/
+artifacts/
+*.tsbuildinfo
 
 # 依赖
 node_modules/
@@ -39,11 +45,21 @@ output/
 *.temp
 .env
 .env.local
+.tmp-edge/
+web-remote/
+web-remote.tar.gz
+笔记.txt
 
 # 上传文件
 uploads/
 media/
 data/
+
+# 敏感登录态
+cookies.txt
+cookies_*.txt
+data/cookies/
+*.cookies.txt
 
 # 测试覆盖率
 *.out
@@ -54,3 +70,6 @@ coverage.html
 
 models/*.bin
 *.bak
+
+# 不应放入 GitHub Actions 目录的本地图片
+.github/workflows/*.png

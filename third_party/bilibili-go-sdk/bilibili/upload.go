@@ -15,17 +15,35 @@ import (
 
 // UploadClient ?????
 type UploadClient struct {
-	client         *Client
-	uploadClient   *http.Client // ??????? HTTP ????????????
-	loginInfo      *LoginInfo
-	uploadProgress UploadProgressCallback
+	client            *Client
+	uploadClient      *http.Client // ??????? HTTP ????????????
+	loginInfo         *LoginInfo
+	uploadProgress    UploadProgressCallback
+	uploadConcurrency int
 }
 
-func buildUploadTransport(proxyURL string) *http.Transport {
+func normalizeUploadConcurrency(concurrency int) int {
+	if concurrency <= 0 {
+		concurrency = 3
+	}
+	if concurrency > 8 {
+		concurrency = 8
+	}
+	return concurrency
+}
+
+func buildUploadTransport(proxyURL string, concurrency int) *http.Transport {
+	concurrency = normalizeUploadConcurrency(concurrency)
+	maxPerHost := concurrency * 2
+	if maxPerHost < 10 {
+		maxPerHost = 10
+	}
+
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConns = 10
-	transport.MaxIdleConnsPerHost = 5
-	transport.IdleConnTimeout = 30 * time.Second
+	transport.MaxIdleConns = maxPerHost * 4
+	transport.MaxIdleConnsPerHost = maxPerHost
+	transport.MaxConnsPerHost = maxPerHost
+	transport.IdleConnTimeout = 90 * time.Second
 	transport.DisableCompression = true
 
 	if proxyURL != "" {
@@ -43,23 +61,38 @@ func NewUploadClient(loginInfo *LoginInfo, opts ...Option) *UploadClient {
 	config := DefaultConfig()
 	config.ApplyOptions(opts...)
 
+	transportConcurrency := config.UploadConcurrency
+	if transportConcurrency <= 0 {
+		transportConcurrency = 8
+	}
 	uploadClient := &http.Client{
-		Timeout:   15 * time.Minute, // ???????15??
-		Transport: buildUploadTransport(config.ProxyURL),
+		Timeout:   3 * time.Minute, // 单次分片请求上限 3 分钟，超时后由分片重试策略接管
+		Transport: buildUploadTransport(config.ProxyURL, transportConcurrency),
 	}
 
 	return &UploadClient{
-		client:         NewClient(opts...),
-		uploadClient:   uploadClient,
-		loginInfo:      loginInfo,
-		uploadProgress: config.UploadProgress,
+		client:            NewClient(opts...),
+		uploadClient:      uploadClient,
+		loginInfo:         loginInfo,
+		uploadProgress:    config.UploadProgress,
+		uploadConcurrency: config.UploadConcurrency,
 	}
 }
 
 // retryFunc ???????????????
 func retryFunc(fn func() error) error {
-	maxRetries := 5 // ??????
-	wait := 2.0     // ????????
+	return retryFuncWithPolicy(5, 2*time.Second, fn)
+}
+
+func retryFuncWithPolicy(maxRetries int, baseDelay time.Duration, fn func() error) error {
+	if maxRetries <= 0 {
+		maxRetries = 1
+	}
+	if baseDelay <= 0 {
+		baseDelay = time.Second
+	}
+
+	wait := baseDelay
 
 	for retries := maxRetries; retries > 0; retries-- {
 		err := fn()
@@ -68,25 +101,56 @@ func retryFunc(fn func() error) error {
 		}
 
 		// ?????????????
-		if retries > 1 && IsNetworkError(err) {
+		if retries > 1 && isRetryableUploadError(err) {
 			// ?????? + ????
-			jitter := rand.Float64() * 2.0           // ??????
-			waitTime := math.Min(jitter+wait, 120.0) // ????????
+			jitter := time.Duration(rand.Float64() * float64(baseDelay))
+			waitTime := wait + jitter
+			maxWait := 120 * time.Second
+			if waitTime > maxWait {
+				waitTime = maxWait
+			}
 
-			log.Printf("?? Retry attempt #%d/%d. Network error detected, sleeping %.2fs before retry. Error: %v",
+			log.Printf("Retry attempt #%d/%d for upload error, sleeping %s before retry. Error: %v",
 				maxRetries-retries+1, maxRetries, waitTime, err)
 
-			time.Sleep(time.Duration(waitTime * float64(time.Second)))
-			wait *= 1.8 // ?????????
+			time.Sleep(waitTime)
+			wait = time.Duration(math.Min(float64(wait)*1.8, float64(maxWait))) // ?????????
 		} else if retries > 1 {
 			// ??????????
-			log.Printf("? Quick retry #%d/%d for non-network error: %v", maxRetries-retries+1, maxRetries, err)
-			time.Sleep(1 * time.Second)
+			log.Printf("Quick retry #%d/%d for non-retryable-classified error: %v", maxRetries-retries+1, maxRetries, err)
+			time.Sleep(baseDelay)
 		} else {
 			return err
 		}
 	}
 	return nil
+}
+
+func isRetryableUploadError(err error) bool {
+	if IsNetworkError(err) || IsRateLimitError(err) {
+		return true
+	}
+
+	errorStr := strings.ToLower(err.Error())
+	retryableHints := []string{
+		"500 internal server error",
+		"502 bad gateway",
+		"503 service unavailable",
+		"504 gateway timeout",
+		"status 500",
+		"status 502",
+		"status 503",
+		"status 504",
+		"temporarily unavailable",
+		"server error",
+		"try again",
+	}
+	for _, hint := range retryableHints {
+		if strings.Contains(errorStr, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // UploadVideo ??????

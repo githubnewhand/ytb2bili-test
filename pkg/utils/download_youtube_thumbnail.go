@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +47,7 @@ type DownloadOptions struct {
 	QualityFallback  bool
 	CreateDirs       bool
 	Overwrite        bool
+	ProxyURL         string
 }
 
 type YouTubeThumbnailDownloader struct {
@@ -63,6 +65,20 @@ func NewYouTubeThumbnailDownloader(opt DownloadOptions) *YouTubeThumbnailDownloa
 		opt.MaxRetries = 3
 	}
 	return &YouTubeThumbnailDownloader{Options: opt}
+}
+
+func (d *YouTubeThumbnailDownloader) httpClient() (*http.Client, error) {
+	client := &http.Client{Timeout: d.Options.Timeout}
+	if strings.TrimSpace(d.Options.ProxyURL) == "" {
+		return client, nil
+	}
+
+	proxyURL, err := url.Parse(d.Options.ProxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("代理地址无效: %w", err)
+	}
+	client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+	return client, nil
 }
 
 func (d *YouTubeThumbnailDownloader) buildFilePath(videoID string, quality ImageQuality, customFilename string) (string, error) {
@@ -98,33 +114,43 @@ func (d *YouTubeThumbnailDownloader) downloadSingleQuality(videoID string, quali
 		}
 	}
 	var lastErr error
+	client, err := d.httpClient()
+	if err != nil {
+		return DownloadResult{Success: false, ErrorMessage: err.Error(), Quality: string(quality)}
+	}
 	for attempt := 0; attempt < d.Options.MaxRetries; attempt++ {
 		log.Printf("尝试下载 %s 质量图片，第 %d 次: %s", quality, attempt+1, url)
-		client := &http.Client{Timeout: d.Options.Timeout}
 		resp, err := client.Get(url)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		defer resp.Body.Close()
 		if resp.StatusCode == 200 {
 			if !strings.HasPrefix(resp.Header.Get("Content-Type"), "image") {
+				resp.Body.Close()
 				return DownloadResult{Success: false, ErrorMessage: "响应内容不是图片", Quality: string(quality)}
 			}
 			f, err := os.Create(filePath)
 			if err != nil {
+				resp.Body.Close()
 				return DownloadResult{Success: false, ErrorMessage: err.Error(), Quality: string(quality)}
 			}
-			defer f.Close()
 			sz, err := io.Copy(f, resp.Body)
+			resp.Body.Close()
+			closeErr := f.Close()
 			if err != nil {
 				return DownloadResult{Success: false, ErrorMessage: err.Error(), Quality: string(quality)}
 			}
+			if closeErr != nil {
+				return DownloadResult{Success: false, ErrorMessage: closeErr.Error(), Quality: string(quality)}
+			}
 			return DownloadResult{Success: true, FilePath: filePath, Quality: string(quality), FileSize: sz}
 		} else if resp.StatusCode == 404 {
+			resp.Body.Close()
 			return DownloadResult{Success: false, ErrorMessage: "图片不存在 (404)", Quality: string(quality)}
 		} else {
 			lastErr = errors.New(resp.Status)
+			resp.Body.Close()
 		}
 	}
 	return DownloadResult{Success: false, ErrorMessage: fmt.Sprintf("下载失败: %v", lastErr), Quality: string(quality)}

@@ -19,9 +19,11 @@ debug = true
   session_secret = "your-session-secret"
 
 [task]
-  max_concurrent_prepare = 2
+  max_concurrent_prepare = 4
 
 [download]
-  use_aria2 = false
+  use_aria2 = true
   aria2_path = ""
   aria2_args = "-x 16 -s 16 -k 1M --file-allocation=none"
+  cookies_path = ""              # 可填手动导出的 YouTube cookies.txt 路径
+  cookies_from_browser = ""      # 可填 chrome/edge/firefox；没有 cookies 文件时从浏览器读取登录态

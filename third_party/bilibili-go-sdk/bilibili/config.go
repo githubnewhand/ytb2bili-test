@@ -9,11 +9,12 @@ import (
 
 // Config SDK??
 type Config struct {
-	HTTPClient     *http.Client
-	UserAgent      string
-	Timeout        time.Duration
-	ProxyURL       string
-	UploadProgress UploadProgressCallback
+	HTTPClient        *http.Client
+	UserAgent         string
+	Timeout           time.Duration
+	ProxyURL          string
+	UploadProgress    UploadProgressCallback
+	UploadConcurrency int
 }
 
 // Option SDK????
@@ -63,6 +64,13 @@ func WithProxy(proxyURL string) Option {
 func WithUploadProgress(callback UploadProgressCallback) Option {
 	return func(c *Config) {
 		c.UploadProgress = callback
+	}
+}
+
+// WithUploadConcurrency caps concurrent chunk uploads.
+func WithUploadConcurrency(concurrency int) Option {
+	return func(c *Config) {
+		c.UploadConcurrency = concurrency
 	}
 }
 

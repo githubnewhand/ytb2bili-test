@@ -106,6 +106,17 @@ func (m *YtDlpManager) GetBinaryPath() string {
 	return m.binaryPath
 }
 
+// Version 获取当前 yt-dlp 版本号
+func (m *YtDlpManager) Version() (string, error) {
+	cmd := exec.Command(m.binaryPath, "--version")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(output)), nil
+}
+
 // Install 下载并安装 yt-dlp
 func (m *YtDlpManager) Install() error {
 	m.logger.Info("📥 开始下载 yt-dlp...")
@@ -263,16 +274,65 @@ func (m *YtDlpManager) downloadFile(url string) error {
 
 // checkVersion 检查版本信息
 func (m *YtDlpManager) checkVersion() error {
-	cmd := exec.Command(m.binaryPath, "--version")
-	output, err := cmd.Output()
+	version, err := m.Version()
 	if err != nil {
 		m.logger.Warnf("⚠️  无法获取 yt-dlp 版本信息: %v", err)
 		return nil
 	}
 
-	version := strings.TrimSpace(string(output))
 	m.logger.Infof("📋 当前 yt-dlp 版本: %s", version)
 	return nil
+}
+
+// CheckAndUpdateIfStale 在版本过旧时自动更新 yt-dlp。
+// yt-dlp 的稳定版本号通常是 YYYY.MM.DD；无法解析时仅记录版本，不阻断下载。
+func (m *YtDlpManager) CheckAndUpdateIfStale(maxAge time.Duration) error {
+	if !m.IsInstalled() {
+		return m.CheckAndInstall()
+	}
+
+	version, err := m.Version()
+	if err != nil {
+		m.logger.Warnf("⚠️  无法获取 yt-dlp 版本信息: %v", err)
+		return nil
+	}
+	m.logger.Infof("📋 当前 yt-dlp 版本: %s", version)
+
+	releaseDate, ok := parseYtDlpVersionDate(version)
+	if !ok {
+		m.logger.Warnf("⚠️  无法解析 yt-dlp 版本日期: %s", version)
+		return nil
+	}
+
+	age := time.Since(releaseDate)
+	if age <= maxAge {
+		return nil
+	}
+
+	m.logger.Warnf("⚠️  yt-dlp 版本已超过 %.0f 天，尝试自动更新", age.Hours()/24)
+	if err := m.Update(); err != nil {
+		return fmt.Errorf("自动更新 yt-dlp 失败: %v", err)
+	}
+	return nil
+}
+
+func parseYtDlpVersionDate(version string) (time.Time, bool) {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return time.Time{}, false
+	}
+
+	parts := strings.Split(version, ".")
+	if len(parts) < 3 {
+		return time.Time{}, false
+	}
+
+	dateText := strings.Join(parts[:3], ".")
+	parsed, err := time.Parse("2006.1.2", dateText)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 // Update 更新 yt-dlp 到最新版本

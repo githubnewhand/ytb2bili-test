@@ -97,6 +97,133 @@ func (uc *UploadClient) SubmitVideo(studio *Studio) (*ResponseData, error) {
 }
 
 // UploadCover 上传封面
+// SubmitVideoWeb submits through Creator Center's web endpoint. UPower-exclusive
+// settings are a web-only capability and are silently ignored by the app endpoint.
+func (uc *UploadClient) SubmitVideoWeb(studio *Studio) (*ResponseData, error) {
+	csrf, err := uc.loginInfo.GetCSRFToken()
+	if err != nil {
+		return nil, fmt.Errorf("get csrf token: %w", err)
+	}
+	jsonData, err := json.Marshal(studio)
+	if err != nil {
+		return nil, fmt.Errorf("marshal studio: %w", err)
+	}
+	submitURL := fmt.Sprintf("https://member.bilibili.com/x/vu/web/add/v3?csrf=%s&ts=%d", url.QueryEscape(csrf), time.Now().UnixMilli())
+	req, err := http.NewRequest("POST", submitURL, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("create web submit request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Cookie", uc.loginInfo.GetCookieString())
+	req.Header.Set("Referer", "https://member.bilibili.com/platform/upload/video/frame")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36")
+	resp, err := uc.client.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("web submit request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read web submit response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("web submit status %d: %s", resp.StatusCode, string(body))
+	}
+	var result ResponseData
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse web submit response: %w, body: %s", err, string(body))
+	}
+	return &result, nil
+}
+
+// GetUPowerLevelID resolves the account-specific tier ID from Creator Center.
+func (uc *UploadClient) GetUPowerLevelID(levelPrice int) (string, error) {
+	req, err := http.NewRequest("GET", "https://member.bilibili.com/x/vupre/web/archive/pre", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Cookie", uc.loginInfo.GetCookieString())
+	req.Header.Set("Referer", "https://member.bilibili.com/york/videoup?new")
+	req.Header.Set("User-Agent", uc.client.userAgent)
+	resp, err := uc.client.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			ChargingPayInfo struct {
+				UPowerAuth int `json:"upower_auth"`
+				Levels     []struct {
+					ID         string `json:"id"`
+					LevelPrice int    `json:"level_price"`
+					Title      string `json:"upower_title"`
+				} `json:"upower_level_list"`
+			} `json:"charging_pay_info"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if result.Code != 0 {
+		return "", fmt.Errorf("creator preflight failed: code=%d message=%s", result.Code, result.Message)
+	}
+	if result.Data.ChargingPayInfo.UPowerAuth != 1 {
+		return "", fmt.Errorf("account is not authorized for UPower-exclusive submission")
+	}
+	for _, level := range result.Data.ChargingPayInfo.Levels {
+		if level.LevelPrice == levelPrice && level.ID != "" {
+			return level.ID, nil
+		}
+	}
+	return "", fmt.Errorf("UPower tier price %d was not found in Creator Center", levelPrice)
+}
+
+// IsUPowerExclusive verifies the owner-visible Creator Center state. Monthly
+// UPower uses charging_pay=1 and upower_mode=0; mode 3 means single-video pay.
+func (uc *UploadClient) IsUPowerExclusive(bvid string) (bool, error) {
+	viewURL := "https://member.bilibili.com/x/vupre/web/archive/view?bvid=" + url.QueryEscape(bvid)
+	req, err := http.NewRequest("GET", viewURL, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Cookie", uc.loginInfo.GetCookieString())
+	req.Header.Set("Referer", "https://member.bilibili.com/platform/upload-manager/article")
+	req.Header.Set("User-Agent", uc.client.userAgent)
+	resp, err := uc.client.httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	var result struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Archive struct {
+				ChargingPay int             `json:"charging_pay"`
+				UPowerMode  int             `json:"upower_mode"`
+				UPowerLevel json.RawMessage `json:"upower_level"`
+				Preview     json.RawMessage `json:"preview"`
+				State       int             `json:"state"`
+				StateDesc   string          `json:"state_desc"`
+			} `json:"archive"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+	if result.Code != 0 {
+		return false, fmt.Errorf("creator archive view failed: code=%d message=%s", result.Code, result.Message)
+	}
+	archive := result.Data.Archive
+	if archive.ChargingPay != 1 || len(archive.UPowerLevel) == 0 || string(archive.UPowerLevel) == "null" {
+		return false, fmt.Errorf("creator archive is not monthly UPower exclusive: charging_pay=%d upower_mode=%d upower_level=%s preview=%s state=%d(%s)", archive.ChargingPay, archive.UPowerMode, string(archive.UPowerLevel), string(archive.Preview), archive.State, archive.StateDesc)
+	}
+	return true, nil
+}
+
 func (uc *UploadClient) UploadCover(imagePath string) (string, error) {
 	imageData, err := os.ReadFile(imagePath)
 	if err != nil {
