@@ -2,9 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import Image from 'next/image';
-import { RefreshCw, Clock, Play, CheckCircle, Upload, AlertCircle, ExternalLink, Coins } from 'lucide-react';
-import VideoActions from '@/components/video/VideoActions';
-import { PublishAudience } from '@/types';
+import { RefreshCw, Clock, Play, CheckCircle, Upload, AlertCircle, ExternalLink } from 'lucide-react';
 
 interface Video {
   id: number;
@@ -17,15 +15,6 @@ interface Video {
   task_steps?: TaskStep[];
   progress?: TaskProgress;
   bili_bvid?: string;
-  bili_aid?: number;
-  publish_audience?: PublishAudience;
-  audience_selected_at?: string;
-  upower_preview_seconds?: number;
-  record_type?: 'source' | 'compilation';
-  workflow_state?: string;
-  scheduled_upload_at?: string;
-  upload_policy?: 'scheduled' | 'manual' | 'immediate';
-  rights_verified?: boolean;
   cover_image?: string;
 }
 
@@ -73,19 +62,10 @@ interface ProgressInfo {
 
 const DEFAULT_STEP_COUNT = 6;
 
-const PUBLISH_AUDIENCE_LABELS: Record<string, string> = {
-  free: '\u514d\u8d39\u516c\u5f00',
-  charge_30: '30\u5143\u5145\u7535\u4e13\u5c5e',
-  charge_50: '50\u5143\u5145\u7535\u4e13\u5c5e',
-};
-
 const getFallbackProgress = (status: string): ProgressInfo => {
   const fallbackByStatus: Record<string, Omit<ProgressInfo, 'failedSteps' | 'nextStep' | 'currentStepProgress' | 'currentStepMessage' | 'isRunning'>> = {
     '001': { totalSteps: DEFAULT_STEP_COUNT, completedSteps: 0, percent: 0, currentStep: '' },
     '002': { totalSteps: DEFAULT_STEP_COUNT, completedSteps: 0, percent: 0, currentStep: '准备任务链' },
-    '100': { totalSteps: 1, completedSteps: 1, percent: 100, currentStep: '' },
-    '101': { totalSteps: DEFAULT_STEP_COUNT, completedSteps: 1, percent: 15, currentStep: '等待继续处理' },
-    '110': { totalSteps: 1, completedSteps: 1, percent: 100, currentStep: '' },
     '200': { totalSteps: DEFAULT_STEP_COUNT, completedSteps: 4, percent: 67, currentStep: '' },
     '201': { totalSteps: DEFAULT_STEP_COUNT, completedSteps: 4, percent: 67, currentStep: '上传到Bilibili' },
     '299': { totalSteps: DEFAULT_STEP_COUNT, completedSteps: 4, percent: 67, currentStep: '' },
@@ -103,7 +83,7 @@ const getFallbackProgress = (status: string): ProgressInfo => {
     currentStepProgress: 0,
     currentStepMessage: '',
     nextStep: '',
-    isRunning: ['002', '101', '201', '301'].includes(status),
+    isRunning: ['002', '201', '301'].includes(status),
   };
 };
 
@@ -230,7 +210,7 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
   const hasLiveTasks = videos.some(video => (
     video.progress?.is_running ||
     Boolean(video.progress?.current_step) ||
-    ['002', '101', '201', '301'].includes(video.status)
+    ['002', '201', '301'].includes(video.status)
   ));
 
   useEffect(() => {
@@ -242,7 +222,7 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
   useEffect(() => {
     if (!expandedVideoId || !detailedVideo) return;
     const progress = getVideoProgress(detailedVideo);
-    if (!progress.isRunning && !['002', '101', '201', '301'].includes(detailedVideo.status)) return;
+    if (!progress.isRunning && !['002', '201', '301'].includes(detailedVideo.status)) return;
 
     const interval = window.setInterval(() => fetchVideoDetail(expandedVideoId, false), 2000);
     return () => window.clearInterval(interval);
@@ -275,7 +255,7 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
       console.error('Error retrying step:', error);
     }
   };
-  
+
   const getStatusColor = (status: string) => {
     switch (status) {
       case 'completed':
@@ -295,9 +275,6 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
     const statusMap: { [key: string]: { label: string; color: string; icon: any; category: TabType } } = {
       '001': { label: '待处理', color: 'bg-gray-100 text-gray-700', icon: Clock, category: 'pending' },
       '002': { label: '处理中', color: 'bg-blue-100 text-blue-700', icon: Play, category: 'preparing' },
-      '100': { label: '待选择发布方式', color: 'bg-amber-100 text-amber-800', icon: Clock, category: 'pending' },
-      '101': { label: '等待后处理', color: 'bg-blue-100 text-blue-700', icon: Play, category: 'preparing' },
-      '110': { label: '充电素材池', color: 'bg-pink-100 text-pink-700', icon: Coins, category: 'ready' },
       '200': { label: '准备就绪', color: 'bg-green-100 text-green-700', icon: CheckCircle, category: 'ready' },
       '201': { label: '上传视频中', color: 'bg-purple-100 text-purple-700', icon: Upload, category: 'uploading' },
       '299': { label: '上传失败', color: 'bg-red-100 text-red-700', icon: AlertCircle, category: 'failed' },
@@ -314,10 +291,7 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
   const getStageDescription = (status: string) => {
     const stageMap: { [key: string]: string } = {
       '001': '等待开始处理',
-      '002': '正在下载视频或执行准备任务链',
-      '100': '下载已完成，等待选择免费公开或充电档位',
-      '101': '已选择免费公开，等待继续执行字幕、翻译和元数据处理',
-      '110': '已进入对应充电素材池，等待随机选入拼接批次',
+      '002': '正在执行准备任务链（下载视频→生成字幕→翻译字幕→生成元数据）',
       '200': '准备阶段完成，等待视频上传（每小时上传1个）',
       '201': '正在上传视频到Bilibili',
       '299': '视频上传失败，需要重试',
@@ -333,9 +307,9 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
   // 分类视频
   const categorizeVideos = () => {
     return {
-      pending: videos.filter(v => ['001', '100'].includes(v.status)),
-      preparing: videos.filter(v => ['002', '101'].includes(v.status)),
-      ready: videos.filter(v => ['110', '200'].includes(v.status)),
+      pending: videos.filter(v => v.status === '001'),
+      preparing: videos.filter(v => v.status === '002'),
+      ready: videos.filter(v => v.status === '200'),
       uploading: videos.filter(v => ['201', '300', '301'].includes(v.status)),
       completed: videos.filter(v => v.status === '400'),
       failed: videos.filter(v => ['299', '399', '999'].includes(v.status)),
@@ -442,10 +416,9 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
                 const Icon = statusInfo.icon;
                 const detailForVideo = expandedVideoId === video.id && detailedVideo?.id === video.id ? detailedVideo : video;
                 const progressInfo = getVideoProgress(detailForVideo);
-                const audienceLabel = video.publish_audience ? PUBLISH_AUDIENCE_LABELS[video.publish_audience] : '';
                 return (
                   <div key={video.id}>
-                    <div 
+                    <div
                       className="p-4 hover:bg-gray-50 transition-colors cursor-pointer"
                       onClick={() => handleToggleDetails(video.id)}
                     >
@@ -459,13 +432,13 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
                                 rel="noopener noreferrer"
                                 onClick={(event) => event.stopPropagation()}
                                 className="group inline-flex min-w-0 items-center gap-1 font-medium text-gray-900 hover:text-blue-600"
-                                title="Open original video"
+                                title="打开原视频"
                               >
                                 <span className="truncate group-hover:underline">
                                   {video.title || video.video_id}
                                 </span>
                                 <ExternalLink className="h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
-                                <span className="sr-only">Open original video in a new tab</span>
+                                <span className="sr-only">在新标签页打开原视频</span>
                               </a>
                             ) : (
                               <h4 className="font-medium text-gray-900">
@@ -476,20 +449,12 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
                               <Icon className="w-3 h-3" />
                               <span>{statusInfo.label}</span>
                             </span>
-                            {audienceLabel && (
-                              <span className={`text-xs px-2 py-1 rounded ${
-                                video.publish_audience === 'free'
-                                  ? 'bg-sky-100 text-sky-700'
-                                  : 'bg-pink-100 text-pink-700'
-                              }`}>
-                                {'\u6295\u7a3f\u9009\u62e9\uff1a'}{audienceLabel}
-                              </span>
-                            )}
                             {video.bili_bvid && (
                               <a
                                 href={`https://www.bilibili.com/video/${video.bili_bvid}`}
                                 target="_blank"
                                 rel="noopener noreferrer"
+                                onClick={(event) => event.stopPropagation()}
                                 className="text-xs text-blue-600 hover:underline"
                               >
                                 {video.bili_bvid}
@@ -510,7 +475,7 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
                           {video.cover_image ? (
                             <Image
                               src={video.cover_image}
-                              alt={`${video.title || video.video_id} \u5c01\u9762`}
+                              alt={`${video.title || video.video_id} 封面`}
                               width={160}
                               height={96}
                               className="h-24 w-40 rounded-md border border-gray-200 bg-gray-100 object-cover"
@@ -518,13 +483,13 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
                             />
                           ) : (
                             <div className="flex h-24 w-40 items-center justify-center rounded-md border border-dashed border-gray-300 bg-gray-50 text-xs text-gray-400">
-                              {'\u6682\u65e0\u5c01\u9762'}
+                              暂无封面
                             </div>
                           )}
                           <button
                             className="px-4 py-2 text-sm text-blue-600 hover:bg-blue-50 rounded transition-colors"
                           >
-                            {expandedVideoId === video.id ? '\u6536\u8d77\u8be6\u60c5' : '\u67e5\u770b\u8be6\u60c5'}
+                            {expandedVideoId === video.id ? '收起详情' : '查看详情'}
                           </button>
                         </div>
                       </div>
@@ -534,31 +499,10 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
                         {isDetailLoading ? (
                           <div className="text-center text-gray-500">加载任务步骤...</div>
                         ) : detailedVideo && detailedVideo.task_steps ? (
-                          <div className="space-y-4">
-                            {['100', '110', '200', '299', '300', '399'].includes(detailedVideo.status) && (
-                              <VideoActions
-                                videoId={detailedVideo.video_id}
-                                status={detailedVideo.status}
-                                biliBvid={detailedVideo.bili_bvid}
-                                biliAid={detailedVideo.bili_aid}
-                                publishAudience={detailedVideo.publish_audience}
-                                audienceSelectedAt={detailedVideo.audience_selected_at}
-                                upowerPreviewSeconds={detailedVideo.upower_preview_seconds}
-                                recordType={detailedVideo.record_type}
-                                workflowState={detailedVideo.workflow_state}
-                                scheduledUploadAt={detailedVideo.scheduled_upload_at}
-                                rightsVerified={detailedVideo.rights_verified}
-                                onSuccess={() => {
-                                  fetchVideoDetail(video.id, false);
-                                  fetchVideos(false);
-                                }}
-                              />
-                            )}
-                            <TaskStepDetail
-                              steps={detailedVideo.task_steps}
-                              onRetry={(stepName) => handleRetryStep(video.id, stepName)}
-                            />
-                          </div>
+                          <TaskStepDetail
+                            steps={detailedVideo.task_steps}
+                            onRetry={(stepName) => handleRetryStep(video.id, stepName)}
+                          />
                         ) : (
                           <div className="text-center text-gray-500">无任务步骤信息</div>
                         )}
@@ -607,7 +551,7 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
               <div className="flex-1">
                 <h4 className="font-medium text-gray-900 mb-1">准备阶段任务链</h4>
                 <p className="text-sm text-gray-600">
-                  每5秒检查一次：先下载视频并等待发布方式；免费公开视频继续执行字幕、翻译和元数据处理
+                  每5秒检查一次待处理任务，依次执行：下载视频 → 生成字幕 → 翻译字幕 → 生成元数据
                 </p>
                 <div className="mt-2 text-xs text-gray-500">
                   当前准备中: {categories.preparing.length} 个 | 待处理: {categories.pending.length} 个
@@ -622,7 +566,7 @@ export default function TaskQueueStats({ onVideoSelect }: TaskQueueStatsProps) {
               <div className="flex-1">
                 <h4 className="font-medium text-gray-900 mb-1">视频上传调度</h4>
                 <p className="text-sm text-gray-600">
-                  免费公开视频准备完成1小时后进入持久化上传队列；也可在详情中立即上传
+                  每5分钟检查一次，每小时自动上传1个准备就绪的视频到Bilibili
                 </p>
                 <div className="mt-2 text-xs text-gray-500">
                   准备就绪: {categories.ready.length} 个 | 上传中: {categories.uploading.length} 个

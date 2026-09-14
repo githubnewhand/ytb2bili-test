@@ -1,12 +1,15 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { RefreshCw, Clock, Upload, Play, CheckCircle, AlertCircle, Calendar } from 'lucide-react';
+import Image from 'next/image';
+import { RefreshCw, Clock, Upload, Play, CheckCircle, Calendar, ExternalLink } from 'lucide-react';
 
 interface Video {
   id: number;
   video_id: string;
   title: string;
+  url?: string;
+  cover_image?: string;
   status: string;
   created_at: string;
   updated_at: string;
@@ -232,38 +235,39 @@ export default function ScheduleManager({ onVideoSelect }: ScheduleManagerProps)
                 
                 return (
                   <div key={task.id} className="p-4 hover:bg-gray-50 transition-colors">
-                    <div className="flex items-center justify-between">
-                      <div className="flex-1">
-                        <div className="flex items-center space-x-3 mb-2">
-                          <h4 className="font-medium text-gray-900">
-                            {task.video.title || task.video.video_id}
-                          </h4>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                      <div className="min-w-0 flex-1">
+                        <div className="mb-2 flex min-w-0 flex-wrap items-center gap-3">
+                          <VideoTitle video={task.video} />
                           <span className="text-xs px-2 py-1 rounded bg-green-100 text-green-700">
                             准备就绪
                           </span>
                         </div>
-                        <div className="flex items-center space-x-6 text-xs text-gray-500">
+                        <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-xs text-gray-500">
                           <span>视频ID: {task.video.video_id}</span>
                           <span>准备完成: {new Date(task.video.updated_at).toLocaleString('zh-CN')}</span>
                         </div>
                       </div>
-                      <button
-                        onClick={() => handleManualUpload(task.id, 'video')}
-                        disabled={isExecuting}
-                        className="ml-4 flex items-center space-x-2 px-4 py-2 text-sm text-white bg-purple-600 hover:bg-purple-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        {isExecuting ? (
-                          <>
-                            <RefreshCw className="w-4 h-4 animate-spin" />
-                            <span>上传中...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Play className="w-4 h-4" />
-                            <span>立即上传</span>
-                          </>
-                        )}
-                      </button>
+                      <div className="flex flex-shrink-0 items-center justify-between gap-3 sm:justify-end">
+                        <VideoCover video={task.video} />
+                        <button
+                          onClick={() => handleManualUpload(task.id, 'video')}
+                          disabled={isExecuting}
+                          className="flex items-center space-x-2 whitespace-nowrap rounded-lg bg-purple-600 px-4 py-2 text-sm text-white transition-colors hover:bg-purple-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {isExecuting ? (
+                            <>
+                              <RefreshCw className="w-4 h-4 animate-spin" />
+                              <span>上传中...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Play className="w-4 h-4" />
+                              <span>立即上传</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );
@@ -305,12 +309,10 @@ export default function ScheduleManager({ onVideoSelect }: ScheduleManagerProps)
                 
                 return (
                   <div key={task.id} className="p-4 hover:bg-gray-50 transition-colors">
-                    <div className="flex items-center justify-between">
-                      <div className="flex-1">
-                        <div className="flex items-center space-x-3 mb-2">
-                          <h4 className="font-medium text-gray-900">
-                            {task.video.title || task.video.video_id}
-                          </h4>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                      <div className="min-w-0 flex-1">
+                        <div className="mb-2 flex min-w-0 flex-wrap items-center gap-3">
+                          <VideoTitle video={task.video} />
                           <span className={`text-xs px-2 py-1 rounded ${task.video.status === '399' ? 'bg-red-100 text-red-700' : 'bg-cyan-100 text-cyan-700'}`}>
                             {task.video.status === '399' ? '字幕上传失败' : '视频已上传'}
                           </span>
@@ -325,28 +327,31 @@ export default function ScheduleManager({ onVideoSelect }: ScheduleManagerProps)
                             </a>
                           )}
                         </div>
-                        <div className="flex items-center space-x-6 text-xs text-gray-500">
+                        <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-xs text-gray-500">
                           <span>视频ID: {task.video.video_id}</span>
                           <span>视频上传: {new Date(task.video.updated_at).toLocaleString('zh-CN')}</span>
                         </div>
                       </div>
-                      <button
-                        onClick={() => handleManualUpload(task.id, 'subtitle')}
-                        disabled={isExecuting}
-                        className={`ml-4 flex items-center space-x-2 px-4 py-2 text-sm text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${task.video.status === '399' ? 'bg-red-600 hover:bg-red-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}
-                      >
-                        {isExecuting ? (
-                          <>
-                            <RefreshCw className="w-4 h-4 animate-spin" />
-                            <span>上传中...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Play className="w-4 h-4" />
-                            <span>{task.video.status === '399' ? '重试上传字幕' : '立即上传字幕'}</span>
-                          </>
-                        )}
-                      </button>
+                      <div className="flex flex-shrink-0 items-center justify-between gap-3 sm:justify-end">
+                        <VideoCover video={task.video} />
+                        <button
+                          onClick={() => handleManualUpload(task.id, 'subtitle')}
+                          disabled={isExecuting}
+                          className={`flex items-center space-x-2 whitespace-nowrap rounded-lg px-4 py-2 text-sm text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${task.video.status === '399' ? 'bg-red-600 hover:bg-red-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}
+                        >
+                          {isExecuting ? (
+                            <>
+                              <RefreshCw className="w-4 h-4 animate-spin" />
+                              <span>上传中...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Play className="w-4 h-4" />
+                              <span>{task.video.status === '399' ? '重试上传字幕' : '立即上传字幕'}</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );
@@ -415,6 +420,56 @@ export default function ScheduleManager({ onVideoSelect }: ScheduleManagerProps)
         </div>
       </div>
     </div>
+  );
+}
+
+function VideoTitle({ video }: { video: Video }) {
+  const title = video.title || video.video_id;
+
+  if (!video.url) {
+    return (
+      <h4 className="min-w-0 truncate font-medium text-gray-900" title={title}>
+        {title}
+      </h4>
+    );
+  }
+
+  return (
+    <a
+      href={video.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(event) => event.stopPropagation()}
+      className="group inline-flex min-w-0 max-w-full items-center gap-1 font-medium text-gray-900 hover:text-blue-600"
+      title="打开原视频"
+    >
+      <span className="truncate group-hover:underline">{title}</span>
+      <ExternalLink className="h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
+      <span className="sr-only">在新标签页打开原视频</span>
+    </a>
+  );
+}
+
+function VideoCover({ video }: { video: Video }) {
+  const title = video.title || video.video_id;
+
+  if (!video.cover_image) {
+    return (
+      <div className="flex h-[68px] w-28 flex-shrink-0 items-center justify-center rounded-md border border-gray-200 bg-gray-50 text-xs text-gray-400">
+        暂无封面
+      </div>
+    );
+  }
+
+  return (
+    <Image
+      src={video.cover_image}
+      alt={`${title} 封面`}
+      width={112}
+      height={68}
+      className="h-[68px] w-28 flex-shrink-0 rounded-md border border-gray-200 bg-gray-100 object-cover"
+      unoptimized
+    />
   );
 }
 

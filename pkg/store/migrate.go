@@ -7,14 +7,13 @@ import (
 
 // MigrateDatabase 自动迁移数据库表
 func MigrateDatabase(db *gorm.DB) error {
-	return db.AutoMigrate(
+	if err := db.AutoMigrate(
 		&model.User{},
 		&model.SavedVideo{},
 		&model.TaskStep{},
 		&model.AccountBinding{},
-		&model.ChargePoolItem{},
-		&model.CompilationBatch{},
-		&model.CompilationItem{},
-		&model.UploadJob{},
-	)
+	); err != nil {
+		return err
+	}
+	return recoverLegacyPublicationState(db)
 }
