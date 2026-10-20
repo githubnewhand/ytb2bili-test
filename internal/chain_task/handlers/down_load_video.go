@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -239,6 +240,23 @@ func (t *DownloadVideo) getVideoURL() string {
 }
 
 func (t *DownloadVideo) Execute(context map[string]interface{}) bool {
+	// Wrap the whole step, including stream destinations, retries and merging.
+	// The callback is serialized because stdout and stderr are read concurrently.
+	if reporter, ok := context[types.TaskProgressReporterKey].(types.ProgressReporter); ok && reporter != nil {
+		var progressMu sync.Mutex
+		last := 0
+		context[types.TaskProgressReporterKey] = types.ProgressReporter(func(percent int, message string) {
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			if percent < last {
+				percent = last
+			}
+			last = percent
+			reporter(percent, message)
+		})
+		defer func() { context[types.TaskProgressReporterKey] = reporter }()
+	}
+
 	// Legacy paid-pool videos may already have a complete local media file even
 	// though their old one-step task was not part of the public processing chain.
 	// Reuse that file before invoking yt-dlp so recovery never downloads it again.
@@ -346,6 +364,7 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 		"--socket-timeout", "30",
 		"--retries", "3",
 		"--fragment-retries", "3",
+		"--write-info-json",
 	}
 
 	command = append(command, "--continue", "--part", "--no-playlist")
@@ -417,6 +436,7 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 	}
 
 	// 启动命令
+	downloadStarted := time.Now()
 	if err := cmd.Start(); err != nil {
 		t.App.Logger.Errorf("❌ 启动下载命令失败: %v", err)
 		context["error"] = err.Error()
@@ -429,11 +449,22 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 	recentOutput := newRecentLineBuffer(12)
 
 	// 实时读取输出
-	go t.logOutput(stdout, "INFO", activityCh, context, recentOutput)
-	go t.logOutput(stderr, "ERROR", activityCh, context, recentOutput)
+	progress := &downloadStreamProgress{}
+	var outputWG sync.WaitGroup
+	outputWG.Add(2)
+	go func() {
+		defer outputWG.Done()
+		t.logOutput(stdout, "INFO", activityCh, context, recentOutput, progress)
+	}()
+	go func() {
+		defer outputWG.Done()
+		t.logOutput(stderr, "ERROR", activityCh, context, recentOutput, progress)
+	}()
 
 	// 等待命令完成
-	if err := t.waitForDownload(cmd, cmdCtx, activityCh, overallTimeout); err != nil {
+	downloadErr := t.waitForDownload(cmd, cmdCtx, activityCh, overallTimeout)
+	outputWG.Wait()
+	if err := downloadErr; err != nil {
 		errMsg := t.formatDownloadError(err, recentOutput.String())
 		t.App.Logger.Errorf("❌ 视频下载失败: %s", errMsg)
 		context["error"] = errMsg
@@ -461,7 +492,13 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 	// 12. 获取视频元数据（标题、描述等）
 	t.App.Logger.Info("📋 获取视频元数据...")
 	types.ReportTaskProgress(context, 95, "获取视频元数据")
-	metadata, err := t.getVideoMetadata(ytdlpPath)
+	metadata, err := t.readDownloadMetadata(downloadStarted)
+	if err != nil {
+		t.App.Logger.Debugf("下载元数据不可复用，回退到重新解析: %v", err)
+		metadata, err = t.getVideoMetadata(ytdlpPath)
+	} else {
+		t.App.Logger.Info("复用本次下载的元数据，已核对视频 ID")
+	}
 	if err != nil {
 		t.App.Logger.Warnf("⚠️ 获取视频元数据失败: %v，将使用默认值", err)
 	} else {
@@ -548,6 +585,8 @@ func (t *DownloadVideo) formatDownloadError(err error, recentOutput string) stri
 
 	lowerOutput := strings.ToLower(recentOutput)
 	switch {
+	case strings.Contains(lowerOutput, "http error 403") || strings.Contains(lowerOutput, "403 forbidden"):
+		return "下载失败 [http_403]: 媒体访问被拒绝；需检查认证、挑战处理、媒体地址和网络出口，不能仅凭 403 判断 IP 被封。\n" + recentOutput
 	case strings.Contains(lowerOutput, "sign in to confirm") && strings.Contains(lowerOutput, "not a bot"):
 		return "下载失败: YouTube 要求登录验证，通常是当前 VPN 出口 IP 被风控。请更换非数据中心节点，或导入当前浏览器的 YouTube cookies 后重试。\n" + recentOutput
 	case strings.Contains(lowerOutput, "proxy") || strings.Contains(lowerOutput, "connection refused"):
@@ -558,7 +597,7 @@ func (t *DownloadVideo) formatDownloadError(err error, recentOutput string) stri
 }
 
 // logOutput 实时输出日志
-func (t *DownloadVideo) logOutput(reader io.Reader, level string, activityCh chan<- struct{}, context map[string]interface{}, recentOutput *recentLineBuffer) {
+func (t *DownloadVideo) logOutput(reader io.Reader, level string, activityCh chan<- struct{}, context map[string]interface{}, recentOutput *recentLineBuffer, progress *downloadStreamProgress) {
 	buffer := make([]byte, 4096)
 	var pending strings.Builder
 
@@ -568,14 +607,14 @@ func (t *DownloadVideo) logOutput(reader io.Reader, level string, activityCh cha
 			t.markDownloadActivity(activityCh)
 			for _, r := range string(buffer[:n]) {
 				if r == '\r' || r == '\n' {
-					t.handleDownloadOutputLine(pending.String(), level, context, recentOutput)
+					t.handleDownloadOutputLine(pending.String(), level, context, recentOutput, progress)
 					pending.Reset()
 					continue
 				}
 
 				pending.WriteRune(r)
 				if pending.Len() >= 4096 {
-					t.handleDownloadOutputLine(pending.String(), level, context, recentOutput)
+					t.handleDownloadOutputLine(pending.String(), level, context, recentOutput, progress)
 					pending.Reset()
 				}
 			}
@@ -588,10 +627,10 @@ func (t *DownloadVideo) logOutput(reader io.Reader, level string, activityCh cha
 		}
 	}
 
-	t.handleDownloadOutputLine(pending.String(), level, context, recentOutput)
+	t.handleDownloadOutputLine(pending.String(), level, context, recentOutput, progress)
 }
 
-func (t *DownloadVideo) handleDownloadOutputLine(line, level string, context map[string]interface{}, recentOutput *recentLineBuffer) {
+func (t *DownloadVideo) handleDownloadOutputLine(line, level string, context map[string]interface{}, recentOutput *recentLineBuffer, progress *downloadStreamProgress) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return
@@ -604,11 +643,11 @@ func (t *DownloadVideo) handleDownloadOutputLine(line, level string, context map
 	if strings.Contains(line, "[download]") {
 		if strings.Contains(line, "Destination:") {
 			t.App.Logger.Infof("📥 %s", line)
-			types.ReportTaskProgress(context, 6, "定位下载文件")
+			types.ReportTaskProgress(context, progress.start(), "定位下载文件")
 		} else if strings.Contains(line, "%") {
 			t.App.Logger.Debugf("⏳ %s", line)
 			if percent, ok := parseYtDlpProgressPercent(line); ok {
-				mappedPercent := mapDownloadProgressPercent(percent)
+				mappedPercent := progress.percent(percent)
 				types.ReportTaskProgress(context, mappedPercent, downloadProgressMessage(line, percent))
 			}
 		} else {
@@ -625,7 +664,7 @@ func (t *DownloadVideo) handleDownloadOutputLine(line, level string, context map
 
 	if percent, ok := parseAria2ProgressPercent(line); ok {
 		t.App.Logger.Debugf("🚀 aria2 %s", line)
-		mappedPercent := mapDownloadProgressPercent(percent)
+		mappedPercent := progress.percent(percent)
 		types.ReportTaskProgress(context, mappedPercent, downloadProgressMessage(line, percent))
 		return
 	}
@@ -760,6 +799,7 @@ func (t *DownloadVideo) findDownloadedFile() string {
 
 // VideoMetadataInfo 视频元数据信息
 type VideoMetadataInfo struct {
+	ID          string `json:"id"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Uploader    string `json:"uploader"`
@@ -860,4 +900,87 @@ func (t *DownloadVideo) truncateString(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen]) + "..."
+}
+
+// downloadStreamProgress is intentionally approximate; displayed speed and
+// per-stream percentage remain factual. Never treat this as a byte counter.
+type downloadStreamProgress struct {
+	mu      sync.Mutex
+	streams int
+}
+
+func (p *downloadStreamProgress) start() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.streams++
+	if p.streams > 1 {
+		return 78
+	}
+	return 5
+}
+func (p *downloadStreamProgress) percent(percent int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	if p.streams > 1 {
+		return 78 + percent*12/100
+	}
+	return 5 + percent*73/100
+}
+
+func downloadMetadataID(videoID string) string {
+	// Unknown URL shapes fall back to extraction, never to a directory-wide scan.
+	if strings.Contains(videoID, "://") {
+		u, err := url.Parse(videoID)
+		if err != nil {
+			return ""
+		}
+		switch strings.ToLower(u.Hostname()) {
+		case "youtube.com", "www.youtube.com", "m.youtube.com":
+			videoID = u.Query().Get("v")
+		case "youtu.be":
+			videoID = strings.Trim(u.Path, "/")
+		default:
+			return ""
+		}
+	}
+	if !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(videoID) {
+		return ""
+	}
+	return videoID
+}
+func (t *DownloadVideo) readDownloadMetadata(started time.Time) (*VideoMetadataInfo, error) {
+	id := downloadMetadataID(t.StateManager.VideoID)
+	if id == "" {
+		return nil, fmt.Errorf("cannot identify metadata file safely")
+	}
+	path := filepath.Join(t.StateManager.CurrentDir, id+".info.json")
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() || st.Size() > 16*1024*1024 {
+		return nil, fmt.Errorf("invalid metadata file")
+	}
+	// One-second tolerance for filesystems with coarse modification timestamps.
+	if st.ModTime().Before(started.Add(-time.Second)) {
+		return nil, fmt.Errorf("stale metadata")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var metadata VideoMetadataInfo
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, err
+	}
+	if metadata.ID != id || strings.TrimSpace(metadata.Title) == "" {
+		return nil, fmt.Errorf("metadata identity/title mismatch")
+	}
+	return &metadata, nil
 }
