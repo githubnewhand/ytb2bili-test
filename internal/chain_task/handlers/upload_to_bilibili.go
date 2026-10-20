@@ -25,7 +25,7 @@ import (
 const (
 	bilibiliUploadAPITimeout       = 2 * time.Minute
 	bilibiliVideoUploadMaxAttempts = 3
-	bilibiliCoverUploadMaxAttempts = 2
+	bilibiliCoverUploadMaxAttempts = 4
 	bilibiliSubmitMaxAttempts      = 3
 )
 
@@ -171,19 +171,40 @@ func (t *UploadToBilibili) Execute(context map[string]interface{}) bool {
 	}
 
 	// 3. 查找下载的视频文件
-	videoFiles := t.findVideoFiles()
-	if len(videoFiles) == 0 {
-		errMsg := "未找到视频文件"
+	videoPath, err := t.findVideoFile()
+	if err != nil {
+		errMsg := fmt.Sprintf("投稿前媒体完整性校验失败，已阻止上传损坏视频: %v", err)
 		t.App.Logger.Error("❌ " + errMsg)
 		context["error"] = errMsg
 		return false
 	}
 
-	videoPath := videoFiles[0] // 使用第一个视频文件
 	t.App.Logger.Infof("📹 找到视频文件: %s", filepath.Base(videoPath))
 	types.ReportTaskProgress(context, 0, "找到待上传视频文件")
 
-	// 4. Upload video to Bilibili
+	// 4. 投稿前必须准备并上传封面；失败时不要上传视频文件。
+	coverImagePath := t.resolveCoverImagePath(context)
+	if coverImagePath == "" {
+		errMsg := "未找到或无法下载视频封面，已暂停投稿"
+		if context["error"] != nil {
+			errMsg = fmt.Sprint(context["error"])
+		}
+		t.App.Logger.Error(errMsg)
+		context["error"] = errMsg
+		return false
+	}
+	t.App.Logger.Infof("找到封面图片: %s", filepath.Base(coverImagePath))
+	types.ReportTaskProgress(context, 0, "上传封面")
+	coverURL, err := t.uploadCoverWithRetry(loginInfo, coverImagePath)
+	if err != nil {
+		errMsg := t.getUserFriendlyError(err, "上传封面")
+		t.App.Logger.Errorf("上传封面失败: %v", err)
+		context["error"] = errMsg
+		return false
+	}
+	t.App.Logger.Infof("封面上传成功: %s", coverURL)
+
+	// 5. Upload video to Bilibili
 
 	types.ReportTaskProgress(context, 0, "开始上传视频文件")
 	video, err := t.uploadVideoWithRetry(loginInfo, videoPath, context)
@@ -198,22 +219,6 @@ func (t *UploadToBilibili) Execute(context map[string]interface{}) bool {
 	t.App.Logger.Infof("  Filename: %s", video.Filename)
 	t.App.Logger.Infof("  Title: %s", video.Title)
 	types.ReportTaskProgress(context, 100, "视频文件上传完成")
-
-	// 5. Upload cover when available
-	coverURL := ""
-	if coverImagePath := t.resolveCoverImagePath(context); coverImagePath != "" {
-		t.App.Logger.Infof("📸 找到封面图片: %s", filepath.Base(coverImagePath))
-		types.ReportTaskProgress(context, 100, "上传封面")
-
-		uploadedCoverURL, err := t.uploadCoverWithRetry(loginInfo, coverImagePath)
-		if err != nil {
-			t.App.Logger.Errorf("❌ 上传封面失败: %v", err)
-			t.App.Logger.Warn("⚠️ 将使用默认封面或截取视频画面")
-		} else {
-			coverURL = uploadedCoverURL
-			t.App.Logger.Infof("✓ 封面上传成功: %s", coverURL)
-		}
-	}
 
 	// 6. Build studio payload
 	types.ReportTaskProgress(context, 100, "构建投稿信息")
@@ -296,87 +301,21 @@ func (t *UploadToBilibili) Execute(context map[string]interface{}) bool {
 	return true
 }
 
-// findVideoFiles 查找下载目录中的视频文件
-func (t *UploadToBilibili) findVideoFiles() []string {
-	var videoFiles []string
-	videoExtensions := []string{".mp4", ".flv", ".mkv", ".webm", ".avi", ".mov"}
-
-	files, err := os.ReadDir(t.StateManager.CurrentDir)
-	if err != nil {
-		t.App.Logger.Errorf("读取目录失败: %v", err)
-		return videoFiles
-	}
-
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-
-		ext := strings.ToLower(filepath.Ext(file.Name()))
-		for _, videoExt := range videoExtensions {
-			if ext == videoExt {
-				fullPath := filepath.Join(t.StateManager.CurrentDir, file.Name())
-				videoFiles = append(videoFiles, fullPath)
-				break
-			}
-		}
-	}
-
-	return videoFiles
+// findVideoFile returns only a verified, decodable file with both video and
+// audio streams. Uploading an MP4 merely because its container header is
+// readable can produce a zero-duration transcoding failure on Bilibili.
+func (t *UploadToBilibili) findVideoFile() (string, error) {
+	return findCompleteVideo(t.StateManager.CurrentDir)
 }
 
 func (t *UploadToBilibili) resolveCoverImagePath(context map[string]interface{}) string {
-	if coverImagePath, ok := context["cover_image_path"].(string); ok && t.isUsableFile(coverImagePath) {
-		return coverImagePath
+	coverPath, err := ensureLocalVideoCover(t.App, t.StateManager, context)
+	if err != nil {
+		context["error"] = fmt.Sprintf("封面准备失败: %v", err)
+		t.App.Logger.Errorf("封面准备失败: %v", err)
+		return ""
 	}
-
-	for _, filename := range []string{
-		"maxresdefault.jpg",
-		"sddefault.jpg",
-		"hqdefault.jpg",
-		"mqdefault.jpg",
-		"default.jpg",
-		"cover.jpg",
-	} {
-		coverImagePath := filepath.Join(t.StateManager.CurrentDir, filename)
-		if t.isUsableFile(coverImagePath) {
-			context["cover_image_path"] = coverImagePath
-			t.App.Logger.Infof("✓ 使用已下载的 YouTube 封面: %s", coverImagePath)
-			return coverImagePath
-		}
-	}
-
-	t.App.Logger.Info("未找到本地 YouTube 封面，尝试下载最佳可用封面")
-	result := utils.DownloadYouTubeThumbnail(t.StateManager.VideoID, "best", utils.DownloadOptions{
-		SavePath:         t.StateManager.CurrentDir,
-		FilenameTemplate: "{quality}",
-		Timeout:          10 * time.Second,
-		MaxRetries:       3,
-		QualityFallback:  true,
-		CreateDirs:       true,
-		Overwrite:        false,
-	}, "")
-
-	if downloadResult, ok := result.(utils.DownloadResult); ok && downloadResult.Success && t.isUsableFile(downloadResult.FilePath) {
-		context["cover_image_path"] = downloadResult.FilePath
-		t.App.Logger.Infof("✓ 已下载 YouTube 封面用于投稿: %s", downloadResult.FilePath)
-		return downloadResult.FilePath
-	}
-
-	if downloadResult, ok := result.(utils.DownloadResult); ok && downloadResult.ErrorMessage != "" {
-		t.App.Logger.Warnf("⚠️ 下载 YouTube 封面失败，将使用 B站默认封面: %s", downloadResult.ErrorMessage)
-	} else {
-		t.App.Logger.Warn("⚠️ 下载 YouTube 封面失败，将使用 B站默认封面")
-	}
-	return ""
-}
-
-func (t *UploadToBilibili) isUsableFile(path string) bool {
-	if strings.TrimSpace(path) == "" {
-		return false
-	}
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir() && info.Size() > 0
+	return coverPath
 }
 
 // buildStudioInfo 构建投稿信息
@@ -789,7 +728,16 @@ func (t *UploadToBilibili) shouldRetryUploadError(err error) bool {
 	}
 
 	errorStr := strings.ToLower(err.Error())
-	retryableHints := []string{"timeout", "deadline exceeded", "temporarily unavailable", "service unavailable", "internal server error", "server error", "connection reset", "broken pipe", "eof", "too many requests", "try again", "dns", "no such host", "502", "503", "504"}
+	retryableHints := []string{
+		"timeout", "deadline exceeded", "temporarily unavailable",
+		"service unavailable", "internal server error", "server error",
+		"connection reset", "broken pipe", "eof", "too many requests",
+		"try again", "dns", "no such host", "502", "503", "504",
+		// Bilibili sometimes returns localized transient messages without an
+		// HTTP/network sentinel. Treat only explicit retry-later wording as
+		// transient; authentication and permission errors still fail fast.
+		"请稍后重试", "稍后再试", "操作频繁", "系统繁忙", "服务繁忙",
+	}
 	for _, hint := range retryableHints {
 		if strings.Contains(errorStr, hint) {
 			return true

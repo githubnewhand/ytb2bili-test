@@ -1,0 +1,16 @@
+[Unit]
+Description=Bili-Up Web API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/wcubuntu/ytb2bili-test
+ExecStart=/home/wcubuntu/ytb2bili-test/bili-up-api-server
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

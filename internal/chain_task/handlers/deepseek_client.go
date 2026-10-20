@@ -26,11 +26,17 @@ type DeepSeekClient struct {
 
 // DeepSeekRequest API请求结构
 type DeepSeekRequest struct {
-	Model       string            `json:"model"`
-	Messages    []DeepSeekMessage `json:"messages"`
-	Stream      bool              `json:"stream"`
-	MaxTokens   int               `json:"max_tokens,omitempty"`
-	Temperature float64           `json:"temperature,omitempty"`
+	Model          string                  `json:"model"`
+	Messages       []DeepSeekMessage       `json:"messages"`
+	Stream         bool                    `json:"stream"`
+	MaxTokens      int                     `json:"max_tokens,omitempty"`
+	Temperature    float64                 `json:"temperature,omitempty"`
+	ResponseFormat *DeepSeekResponseFormat `json:"response_format,omitempty"`
+}
+
+// DeepSeekResponseFormat asks compatible endpoints to return a complete JSON object.
+type DeepSeekResponseFormat struct {
+	Type string `json:"type"`
 }
 
 // DeepSeekMessage 消息结构
@@ -266,6 +272,53 @@ func (c *DeepSeekClient) doRequest(systemPrompt, userPrompt string) (string, err
 	}
 
 	return response.Choices[0].Message.Content, nil
+}
+
+// ChatCompletionJSONWithUsage requests JSON mode and exposes finish_reason.
+func (c *DeepSeekClient) ChatCompletionJSONWithUsage(systemPrompt, userPrompt string) (string, *DeepSeekUsage, string, error) {
+	request := DeepSeekRequest{
+		Model: c.Model,
+		Messages: []DeepSeekMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		Stream: false, MaxTokens: c.MaxTokens, Temperature: 0.2,
+		ResponseFormat: &DeepSeekResponseFormat{Type: "json_object"},
+	}
+
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return "", nil, "", fmt.Errorf("序列化请求失败: %v", err)
+	}
+	req, err := http.NewRequest("POST", c.BaseURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", nil, "", fmt.Errorf("创建请求失败: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.APIKey))
+
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return "", nil, "", fmt.Errorf("发送请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", nil, "", fmt.Errorf("读取响应失败: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, "", fmt.Errorf("API返回错误 (状态码: %d): %s", resp.StatusCode, string(body))
+	}
+
+	var response DeepSeekResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return "", nil, "", fmt.Errorf("解析响应失败: %v", err)
+	}
+	if len(response.Choices) == 0 {
+		return "", nil, "", fmt.Errorf("API响应中没有结果")
+	}
+	choice := response.Choices[0]
+	return choice.Message.Content, &response.Usage, choice.FinishReason, nil
 }
 
 // ChatCompletionWithUsage 执行对话补全并返回使用量统计

@@ -24,6 +24,7 @@ type GenerateMetadata struct {
 	DeepSeekClient    *DeepSeekClient
 	GeminiClient      *GeminiClient
 	SavedVideoService *services.SavedVideoService
+	FileOnly          bool // local verification: run the formal handler without writing to the upload database
 }
 
 func NewGenerateMetadata(name string, app *core.AppServer, stateManager *manager.StateManager, client *cos.CosClient, apiKey string, db *gorm.DB, savedVideoService *services.SavedVideoService) *GenerateMetadata {
@@ -64,6 +65,23 @@ func (g *GenerateMetadata) Execute(context map[string]interface{}) bool {
 	g.App.Logger.Infof("开始生成视频标题和描述: VideoID=%s", g.StateManager.VideoID)
 	g.App.Logger.Info("========================================")
 	types.ReportTaskProgress(context, 5, "选择元数据生成方式")
+
+	provider := "auto"
+	if g.App.Config.MetadataGenerationConfig != nil {
+		provider = strings.ToLower(strings.TrimSpace(g.App.Config.MetadataGenerationConfig.Provider))
+		if provider == "" {
+			provider = "auto"
+		}
+	}
+	switch provider {
+	case "ollama":
+		return g.executeWithOllama(context)
+	case "auto":
+		// Preserve the existing Gemini-first, DeepSeek-fallback route.
+	default:
+		context["error"] = fmt.Sprintf("未知元数据生成服务：%s", provider)
+		return false
+	}
 
 	// 0. 检查是否使用 Gemini
 	useGemini := false
@@ -248,7 +266,7 @@ func (g *GenerateMetadata) generateMetadataFromDeepSeek(subtitleText string) (*V
 
 要求：
 1. 标题要简洁有力，严格控制在30个字以内（B站限制80字，但建议30字以内更易读），能够准确概括视频主题，吸引观众点击
-2. 描述要详细但不要过长，严格控制在600-800字以内，包含视频的主要内容和亮点（注意：B站简介限制2000字，需要预留约200字给原视频链接和分隔线）
+2. 描述要详细但不要过长，严格控制在400-600字以内，包含视频的主要内容和亮点（注意：B站简介限制2000字，需要预留约200字给原视频链接和分隔线）
 3. 标签要准确反映视频内容，3-5个即可
 4. 必须使用中文
 5. 输出格式必须是JSON，格式如下：
@@ -261,7 +279,7 @@ func (g *GenerateMetadata) generateMetadataFromDeepSeek(subtitleText string) (*V
 请直接返回JSON格式的结果，不要包含任何其他说明文字。`, subtitleText)
 
 	// 使用 DeepSeekClient 调用 API
-	content, usage, err := g.DeepSeekClient.ChatCompletionWithUsage("你是一个专业的视频内容分析助手，擅长根据视频字幕生成吸引人的标题和描述。", prompt)
+	content, usage, err := g.requestMetadataJSON("你是一个专业的视频内容分析助手，擅长根据视频字幕生成吸引人的标题和描述。", prompt)
 	if err != nil {
 		return nil, fmt.Errorf("调用 DeepSeek API 失败: %v", err)
 	}
@@ -299,6 +317,108 @@ func (g *GenerateMetadata) generateMetadataFromDeepSeek(subtitleText string) (*V
 	}
 
 	return &metadata, nil
+}
+
+// requestMetadataJSON retries incomplete or malformed model output instead of failing the task immediately.
+func (g *GenerateMetadata) requestMetadataJSON(systemPrompt, prompt string) (string, *DeepSeekUsage, error) {
+	const maxAttempts = 3
+	jsonMode := true
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		var content string
+		var usage *DeepSeekUsage
+		var finishReason string
+		var err error
+
+		if jsonMode {
+			content, usage, finishReason, err = g.DeepSeekClient.ChatCompletionJSONWithUsage(systemPrompt, prompt)
+			if err != nil && isJSONModeUnsupported(err) {
+				g.App.Logger.Warn("DeepSeek端点不支持JSON模式，改用提示词约束模式")
+				jsonMode = false
+				content, usage, err = g.DeepSeekClient.ChatCompletionWithUsage(systemPrompt, prompt)
+				finishReason = ""
+			}
+		} else {
+			content, usage, err = g.DeepSeekClient.ChatCompletionWithUsage(systemPrompt, prompt)
+		}
+
+		if err != nil {
+			lastErr = fmt.Errorf("第%d次请求失败: %w", attempt, err)
+		} else if strings.EqualFold(finishReason, "length") || strings.EqualFold(finishReason, "max_tokens") {
+			lastErr = fmt.Errorf("第%d次返回因长度限制被截断", attempt)
+		} else {
+			normalized, normalizeErr := normalizeMetadataJSON(content)
+			if normalizeErr == nil {
+				var metadata VideoMetadata
+				if unmarshalErr := json.Unmarshal([]byte(normalized), &metadata); unmarshalErr != nil {
+					normalizeErr = fmt.Errorf("JSON解析失败: %w", unmarshalErr)
+				} else if validationErr := validateGeneratedMetadata(&metadata); validationErr != nil {
+					normalizeErr = validationErr
+				} else {
+					return normalized, usage, nil
+				}
+			}
+			lastErr = fmt.Errorf("第%d次返回格式无效: %w；内容预览: %s", attempt, normalizeErr, metadataContentPreview(content, 240))
+		}
+
+		g.App.Logger.Warnf("DeepSeek元数据生成未通过校验，准备重试（%d/%d）: %v", attempt, maxAttempts, lastErr)
+		if attempt < maxAttempts {
+			time.Sleep(time.Duration(attempt*2) * time.Second)
+		}
+	}
+
+	return "", nil, fmt.Errorf("连续%d次未获得完整有效的JSON: %w", maxAttempts, lastErr)
+}
+
+func normalizeMetadataJSON(content string) (string, error) {
+	content = strings.TrimSpace(content)
+	start := strings.Index(content, "{")
+	end := strings.LastIndex(content, "}")
+	if start < 0 {
+		return "", fmt.Errorf("未找到JSON对象起始符")
+	}
+	if end < start {
+		return "", fmt.Errorf("JSON对象没有完整结束，返回内容可能被截断")
+	}
+	candidate := strings.TrimSpace(content[start : end+1])
+	if !json.Valid([]byte(candidate)) {
+		return "", fmt.Errorf("返回内容不是有效JSON")
+	}
+	return candidate, nil
+}
+
+func validateGeneratedMetadata(metadata *VideoMetadata) error {
+	if metadata == nil || strings.TrimSpace(metadata.Title) == "" {
+		return fmt.Errorf("生成的标题为空")
+	}
+	if strings.TrimSpace(metadata.Description) == "" {
+		return fmt.Errorf("生成的描述为空")
+	}
+	if len(metadata.Tags) < 3 {
+		return fmt.Errorf("生成的标签少于3个")
+	}
+	if len(metadata.Tags) > 5 {
+		return fmt.Errorf("生成的标签超过5个")
+	}
+	return nil
+}
+
+func isJSONModeUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "response_format") || strings.Contains(message, "json_object")
+}
+
+func metadataContentPreview(content string, maxRunes int) string {
+	content = strings.TrimSpace(content)
+	runes := []rune(content)
+	if len(runes) <= maxRunes {
+		return content
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 // saveMetadataToFile 保存元数据到 meta.json 文件
@@ -490,6 +610,12 @@ func (g *GenerateMetadata) saveMetadataResults(metadata *VideoMetadata, taskCont
 		return false
 	} else {
 		g.App.Logger.Info("✅ meta.json 文件已保存")
+	}
+
+	if g.FileOnly {
+		g.App.Logger.Info("✅ 本地验证模式：meta.json 已保存，不写入上传数据库")
+		types.ReportTaskProgress(taskContext, 98, "元数据文件已生成")
+		return true
 	}
 
 	// 4. 保存到数据库

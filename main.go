@@ -306,8 +306,8 @@ func checkYtDlpInstallation(logger *zap.SugaredLogger, config *types.AppConfig) 
 	// 创建 yt-dlp 管理器
 	manager := utils.NewYtDlpManager(logger, installDir)
 
-	// 检查并自动安装
-	if err := manager.CheckAndInstall(); err != nil {
+	// 检查、自动安装，并在版本超过 yt-dlp 的 90 天支持窗口时更新。
+	if err := manager.CheckAndUpdateIfStale(90 * 24 * time.Hour); err != nil {
 		logger.Errorf("❌ yt-dlp 检查/安装失败: %v", err)
 		logger.Warn("⚠️  视频下载功能可能无法正常工作")
 		logger.Info("💡 您可以手动安装 yt-dlp:")

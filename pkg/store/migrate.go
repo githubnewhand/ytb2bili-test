@@ -12,6 +12,7 @@ func MigrateDatabase(db *gorm.DB) error {
 		&model.SavedVideo{},
 		&model.TaskStep{},
 		&model.AccountBinding{},
+		&model.TranslationCache{},
 	); err != nil {
 		return err
 	}

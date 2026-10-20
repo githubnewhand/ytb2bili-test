@@ -13,7 +13,16 @@ import (
 
 // YtdlpSubtitleDownloader yt-dlp字幕下载器
 type YtdlpSubtitleDownloader struct {
-	logger *zap.SugaredLogger
+	logger      *zap.SugaredLogger
+	proxyURL    string
+	cookiesPath string
+}
+
+// WithNetwork uses the same proxy and cookie file as video downloading.
+func (d *YtdlpSubtitleDownloader) WithNetwork(proxyURL, cookiesPath string) *YtdlpSubtitleDownloader {
+	d.proxyURL = proxyURL
+	d.cookiesPath = cookiesPath
+	return d
 }
 
 // SubtitleInfo 字幕信息
@@ -27,9 +36,9 @@ type SubtitleInfo struct {
 
 // VideoSubtitles 视频字幕列表
 type VideoSubtitles struct {
-	VideoID       string                   `json:"video_id"`
-	Title         string                   `json:"title"`
-	Duration      float64                  `json:"duration"`
+	VideoID       string                    `json:"video_id"`
+	Title         string                    `json:"title"`
+	Duration      float64                   `json:"duration"`
 	Subtitles     map[string][]SubtitleInfo `json:"subtitles"`      // 手动字幕
 	AutoSubtitles map[string][]SubtitleInfo `json:"auto_subtitles"` // 自动生成字幕
 }
@@ -129,15 +138,22 @@ func (d *YtdlpSubtitleDownloader) DownloadSubtitle(videoURL, language, format, o
 
 	// 构建yt-dlp命令
 	args := []string{
-		"--skip-download",           // 跳过视频下载
-		"--write-subs",              // 写入字幕
-		"--sub-langs", language,     // 指定语言
-		"--sub-format", format,      // 指定格式
-		"--convert-subs", format,    // 转换为指定格式
+		"--skip-download",       // 跳过视频下载
+		"--write-subs",          // 写入字幕
+		"--write-auto-subs",     // 没有人工字幕时使用自动字幕
+		"--sub-langs", language, // 指定语言
+		"--sub-format", format, // 指定格式
+		"--convert-subs", format, // 转换为指定格式
 		"-o", outputPath + ".%(ext)s", // 输出路径模板
 		videoURL,
 	}
 
+	if d.cookiesPath != "" {
+		args = append([]string{"--cookies", d.cookiesPath}, args...)
+	}
+	if d.proxyURL != "" {
+		args = append([]string{"--proxy", d.proxyURL}, args...)
+	}
 	cmd := exec.Command("yt-dlp", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -181,12 +197,12 @@ func (d *YtdlpSubtitleDownloader) DownloadAllSubtitles(videoURL, format, outputP
 
 	// 构建yt-dlp命令
 	args := []string{
-		"--skip-download",           // 跳过视频下载
-		"--write-subs",              // 写入字幕
-		"--write-auto-subs",         // 包含自动生成字幕
-		"--all-subs",                // 下载所有字幕
-		"--sub-format", format,      // 指定格式
-		"--convert-subs", format,    // 转换为指定格式
+		"--skip-download",      // 跳过视频下载
+		"--write-subs",         // 写入字幕
+		"--write-auto-subs",    // 包含自动生成字幕
+		"--all-subs",           // 下载所有字幕
+		"--sub-format", format, // 指定格式
+		"--convert-subs", format, // 转换为指定格式
 		"-o", outputPath + ".%(ext)s", // 输出路径模板
 		videoURL,
 	}

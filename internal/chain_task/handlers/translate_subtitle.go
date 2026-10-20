@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,12 +20,15 @@ import (
 
 type TranslateSubtitle struct {
 	base.BaseTask
-	App         *core.AppServer
-	DB          *gorm.DB
-	APIKey      string
-	GroupSize   int
-	MaxWorkers  int // 最大并发数
-	RateLimiter *adaptiveRateLimiter
+	App                 *core.AppServer
+	DB                  *gorm.DB
+	APIKey              string
+	GroupSize           int
+	MaxWorkers          int // 最大并发数
+	RateLimiter         *adaptiveRateLimiter
+	CheckpointPath      string
+	CheckpointSignature string
+	CheckpointResults   map[string]string
 }
 
 func NewTranslateSubtitle(name string, app *core.AppServer, stateManager *manager.StateManager, client *cos.CosClient, db *gorm.DB, apiKey string) *TranslateSubtitle {
@@ -34,11 +38,12 @@ func NewTranslateSubtitle(name string, app *core.AppServer, stateManager *manage
 			StateManager: stateManager,
 			Client:       client,
 		},
-		App:        app,
-		DB:         db,
-		APIKey:     "", // 不再固化API Key，运行时动态获取
-		GroupSize:  15, // 每组15句，降低单次请求长度
-		MaxWorkers: 5,  // worker可以较高，真实请求节奏由自适应限速器控制
+		App:            app,
+		DB:             db,
+		APIKey:         "",                          // 不再固化API Key，运行时动态获取
+		GroupSize:      defaultTranslationGroupSize, // A+：按句数和字符预算动态分组
+		MaxWorkers:     5,                           // worker可以较高，真实请求节奏由自适应限速器控制
+		CheckpointPath: filepath.Join(stateManager.CurrentDir, ".ollama-translation-checkpoint.json"),
 	}
 }
 
@@ -58,6 +63,7 @@ func (t *TranslateSubtitle) getCurrentAPIKey() (string, error) {
 
 // SRTEntry SRT字幕条目
 type SRTEntry struct {
+	CueID    string
 	Index    int
 	TimeCode string
 	Text     string
@@ -161,18 +167,37 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 	t.App.Logger.Info("========================================")
 	types.ReportTaskProgress(context, 5, "检查翻译配置")
 
-	// 0. 动态获取最新的API Key配置
-	currentAPIKey, err := t.getCurrentAPIKey()
-	if err != nil {
-		t.App.Logger.Errorf("❌ %v", err)
-		context["error"] = t.getTranslationError(err)
+	// Provider selection applies to subtitles only. Metadata has its own service.
+	provider := subtitleTranslationProvider(t.App.Config)
+	switch provider {
+	case "deepseek":
+		currentAPIKey, err := t.getCurrentAPIKey()
+		if err != nil {
+			t.App.Logger.Errorf("❌ %v", err)
+			context["error"] = t.getTranslationError(err)
+			return false
+		}
+		t.APIKey = currentAPIKey
+		t.RateLimiter = newAdaptiveRateLimiter(800*time.Millisecond, 350*time.Millisecond, 6*time.Second)
+		t.App.Logger.Infof("字幕翻译服务: DeepSeek (%s)", maskAPIKey(currentAPIKey))
+	case "ollama":
+		_, model, _, err := ollamaSubtitleSettings(t.App.Config)
+		if err != nil {
+			context["error"] = err.Error()
+			return false
+		}
+		if err := checkOllamaReady(t.App.Config); err != nil {
+			context["error"] = err.Error()
+			return false
+		}
+		t.GroupSize = 8
+		t.MaxWorkers = 1 // CPU inference has one local model instance.
+		t.RateLimiter = nil
+		t.App.Logger.Infof("字幕翻译服务: 本机 Ollama (%s)", model)
+	default:
+		context["error"] = fmt.Sprintf("不支持的字幕翻译服务: %s", provider)
 		return false
 	}
-
-	t.App.Logger.Infof("🔑 使用DeepSeek API Key: %s", maskAPIKey(currentAPIKey))
-	// 更新当前使用的API Key
-	t.APIKey = currentAPIKey
-	t.RateLimiter = newAdaptiveRateLimiter(800*time.Millisecond, 350*time.Millisecond, 6*time.Second)
 	types.ReportTaskProgress(context, 10, "读取字幕文件")
 
 	// 1. 检查英文字幕文件是否存在（由 GenerateSubtitles 任务生成）
@@ -204,29 +229,57 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 		return false
 	}
 
+	// CueID只由视频、原始序号和原始时间轴生成；翻译队列可以去重，
+	// 但这些原始条目永远不删除、不合并、不重排。
+	if err := assignSubtitleCueIDs(t.StateManager.VideoID, srtEntries); err != nil {
+		t.App.Logger.Errorf("❌ 生成字幕CueID失败: %v", err)
+		context["error"] = "字幕唯一标识生成失败，已停止翻译以保护时间轴"
+		return false
+	}
+	integritySnapshot, err := snapshotSubtitleIntegrity(srtEntries)
+	if err != nil {
+		t.App.Logger.Errorf("❌ 创建字幕完整性快照失败: %v", err)
+		context["error"] = "字幕完整性检查失败，已停止翻译"
+		return false
+	}
+
 	t.App.Logger.Infof("📝 找到 %d 条字幕", len(srtEntries))
 	types.ReportTaskProgress(context, 15, fmt.Sprintf("解析到%d条字幕", len(srtEntries)))
 
-	// 3. 提取文本进行翻译
-	var texts []string
-	for _, entry := range srtEntries {
-		texts = append(texts, entry.Text)
-	}
-
-	// 4. 执行并发翻译
-	totalGroups := len(t.buildTranslationGroups(texts))
-	t.App.Logger.Infof("🚀 开始并发翻译，每组最多 %d 句，共 %d 组，并发数: %d", t.GroupSize, totalGroups, t.MaxWorkers)
-
-	translatedTexts, err := t.translateTextsInGroupsConcurrent(texts, context)
+	// 3. A+翻译：只对翻译队列去重，逐条缓存，按CueID回填。
+	translatedByCue, translationStats, err := t.translateEntriesAPlus(srtEntries, context)
 	if err != nil {
 		t.App.Logger.Errorf("❌ 翻译失败: %v", err)
 		context["error"] = t.getTranslationError(err)
 		return false
 	}
+	t.App.Logger.Infof(
+		"🚀 A+翻译统计：原始%d条，跳过%d条，队列去重%d条，缓存命中%d个文本/%d个Cue，实际请求%d个文本/%d组，新缓存%d条",
+		translationStats.OriginalEntries,
+		translationStats.BypassedEntries,
+		translationStats.Deduplicated,
+		translationStats.CacheHitTexts,
+		translationStats.CacheHitCues,
+		translationStats.RequestedTexts,
+		translationStats.RequestedGroups,
+		translationStats.CachedTexts,
+	)
+
+	// 4. 写文件前执行原始数量、CueID、时间轴三重校验。
+	if err := validateSubtitleIntegrity(integritySnapshot, srtEntries, translatedByCue); err != nil {
+		t.App.Logger.Errorf("❌ 字幕三重校验失败: %v", err)
+		context["error"] = "字幕完整性校验失败，已停止生成文件以避免字幕错位"
+		return false
+	}
 
 	// 5. 生成中文字幕SRT
 	types.ReportTaskProgress(context, 88, "生成中文字幕")
-	translatedSRT := t.generateTranslatedSRTContent(srtEntries, translatedTexts)
+	translatedSRT := generateTranslatedSRTContentByCue(srtEntries, translatedByCue)
+	if err := t.validateRenderedSubtitle(translatedSRT, t.StateManager.VideoID, integritySnapshot); err != nil {
+		t.App.Logger.Errorf("❌ 生成后的字幕三重校验失败: %v", err)
+		context["error"] = "中文字幕生成后校验失败，已停止保存以避免字幕错位"
+		return false
+	}
 
 	// 6. 保存中文字幕文件
 	types.ReportTaskProgress(context, 92, "保存中文字幕文件")
@@ -237,20 +290,33 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 		return false
 	}
 
-	// 7. 字幕质量校验和优化
+	// 7. 字幕质量校验和优化。Ollama 模式只做本地完整性检查，
+	// 不调用 DeepSeek 修复服务。
 	types.ReportTaskProgress(context, 95, "校验字幕质量")
-	optimizedPath, validationResult, err := t.validateAndOptimizeSubtitles(enSRTPath, zhSRTPath)
+	var optimizedPath string
+	var validationResult *utils.ValidationResult
+	if provider == "deepseek" {
+		optimizedPath, validationResult, err = t.validateAndOptimizeSubtitles(enSRTPath, zhSRTPath)
+	}
 	if err != nil {
 		t.App.Logger.Warnf("⚠️  字幕校验失败，使用原始翻译: %v", err)
-	} else {
+	} else if validationResult != nil {
 		if validationResult.MissingEntries > 0 {
 			t.App.Logger.Infof("🔧 检测到 %d 个问题条目，已尝试修复 %d 个",
 				validationResult.MissingEntries, len(validationResult.FixedEntries))
 
 			if optimizedPath != "" {
-				// 使用优化后的文件替换原文件
-				if err := os.Rename(optimizedPath, zhSRTPath); err == nil {
-					t.App.Logger.Info("✨ 已应用字幕优化结果")
+				// 优化器也必须通过同一组三重校验，否则保留已经验证的原始译文。
+				optimizedContent, readErr := os.ReadFile(optimizedPath)
+				validationErr := readErr
+				if readErr == nil {
+					validationErr = t.validateRenderedSubtitle(string(optimizedContent), t.StateManager.VideoID, integritySnapshot)
+				}
+				if validationErr != nil {
+					t.App.Logger.Warnf("⚠️ 优化字幕未通过三重校验，已保留原始译文: %v", validationErr)
+					_ = os.Remove(optimizedPath)
+				} else if err := os.Rename(optimizedPath, zhSRTPath); err == nil {
+					t.App.Logger.Info("✨ 已应用通过三重校验的字幕优化结果")
 				}
 			}
 		}
@@ -259,7 +325,17 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 	// 8. 保存文件路径到 context
 	context["en_srt_path"] = enSRTPath
 	context["zh_srt_path"] = zhSRTPath
-	context["translated_count"] = len(translatedTexts)
+	context["translated_count"] = len(translatedByCue)
+	context["translation_stats"] = map[string]interface{}{
+		"original_entries": translationStats.OriginalEntries,
+		"bypassed_entries": translationStats.BypassedEntries,
+		"deduplicated":     translationStats.Deduplicated,
+		"cache_hit_texts":  translationStats.CacheHitTexts,
+		"cache_hit_cues":   translationStats.CacheHitCues,
+		"requested_texts":  translationStats.RequestedTexts,
+		"requested_groups": translationStats.RequestedGroups,
+		"cached_texts":     translationStats.CachedTexts,
+	}
 
 	// 添加校验结果信息
 	if validationResult != nil {
@@ -272,7 +348,7 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 	}
 
 	t.App.Logger.Infof("✓ 中文字幕已保存: %s", zhSRTPath)
-	t.App.Logger.Infof("✓ 翻译完成: %d/%d 条字幕", len(translatedTexts), len(texts))
+	t.App.Logger.Infof("✓ 翻译完成并通过三重校验: %d/%d 条字幕", len(translatedByCue), len(srtEntries))
 	t.App.Logger.Info("========================================")
 	types.ReportTaskProgress(context, 98, "翻译步骤收尾")
 
@@ -281,49 +357,35 @@ func (t *TranslateSubtitle) Execute(context map[string]interface{}) bool {
 
 // parseSRTContent 解析SRT文件内容
 func (t *TranslateSubtitle) parseSRTContent(content string) ([]SRTEntry, error) {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
 	lines := strings.Split(content, "\n")
-	var entries []SRTEntry
-	var currentEntry SRTEntry
-	var textLines []string
-	stage := 0 // 0=等待序号, 1=等待时间码, 2=读取文本
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		if line == "" {
-			// 空行表示一个条目结束
-			if stage == 2 && len(textLines) > 0 {
-				currentEntry.Text = strings.Join(textLines, "\n")
-				entries = append(entries, currentEntry)
-				textLines = nil
-				stage = 0
-			}
+	entries := make([]SRTEntry, 0)
+	for i := 0; i+1 < len(lines); {
+		index, err := strconv.Atoi(strings.TrimSpace(lines[i]))
+		if err != nil || !strings.Contains(lines[i+1], "-->") {
+			i++
 			continue
 		}
-
-		switch stage {
-		case 0: // 读取序号
-			var index int
-			if _, err := fmt.Sscanf(line, "%d", &index); err == nil {
-				currentEntry = SRTEntry{Index: index}
-				stage = 1
+		entry := SRTEntry{Index: index, TimeCode: strings.TrimSpace(lines[i+1])}
+		i += 2
+		textLines := make([]string, 0)
+		for i < len(lines) {
+			if i+1 < len(lines) {
+				if _, err := strconv.Atoi(strings.TrimSpace(lines[i])); err == nil && strings.Contains(lines[i+1], "-->") {
+					break
+				}
 			}
-		case 1: // 读取时间码
-			if strings.Contains(line, "-->") {
-				currentEntry.TimeCode = line
-				stage = 2
+			if line := strings.TrimSpace(lines[i]); line != "" {
+				textLines = append(textLines, line)
 			}
-		case 2: // 读取文本
-			textLines = append(textLines, line)
+			i++
+		}
+		if len(textLines) > 0 {
+			entry.Text = strings.Join(textLines, "\n")
+			entries = append(entries, entry)
 		}
 	}
-
-	// 处理最后一个条目（如果文件末尾没有空行）
-	if stage == 2 && len(textLines) > 0 {
-		currentEntry.Text = strings.Join(textLines, "\n")
-		entries = append(entries, currentEntry)
-	}
-
 	return entries, nil
 }
 
@@ -558,6 +620,9 @@ func (t *TranslateSubtitle) isFatalTranslationError(err error) bool {
 		"403",
 		"insufficient_quota",
 		"quota",
+		"本机 ollama 未运行",
+		"本机 ollama 缺少模型",
+		"连接本机 ollama 失败",
 	}
 	for _, marker := range fatalMarkers {
 		if strings.Contains(errorStr, strings.ToLower(marker)) {
@@ -783,6 +848,9 @@ func (t *TranslateSubtitle) callDeepSeekAPI(systemPrompt, userPrompt string) (st
 
 // getTranslationError 将翻译错误转换为用户友好的错误信息
 func (t *TranslateSubtitle) getTranslationError(err error) string {
+	if subtitleTranslationProvider(t.App.Config) == "ollama" {
+		return fmt.Sprintf("本机 Ollama 字幕翻译失败: %v", err)
+	}
 	errorStr := err.Error()
 
 	if strings.Contains(errorStr, "DeepSeek API Key 未配置") {

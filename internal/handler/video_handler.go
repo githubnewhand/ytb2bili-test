@@ -6,14 +6,19 @@ import (
 	"github.com/difyz9/ytb2bili/internal/core"
 	"github.com/difyz9/ytb2bili/internal/core/services"
 	"github.com/difyz9/ytb2bili/pkg/store/model"
+	"github.com/difyz9/ytb2bili/pkg/utils"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+var videoCoverRepairMu sync.Mutex
 
 type VideoHandler struct {
 	BaseHandler
@@ -596,9 +601,10 @@ func (h *VideoHandler) getVideoMetaData(videoID string) map[string]interface{} {
 	return metaData
 }
 
-// getVideoCoverImage 获取视频封面图片路径
+// getVideoCoverImage 获取视频封面图片路径。只要视频目录存在就返回稳定的
+// 本地接口地址；接口会在图片缺失时自动修复历史任务的封面。
 func (h *VideoHandler) getVideoCoverImage(videoID string) string {
-	if h.findVideoCoverPath(videoID) != "" {
+	if h.findVideoCoverPath(videoID) != "" || h.findExistingVideoDirectory(videoID) != "" {
 		return fmt.Sprintf("/api/v1/videos/%s/cover", videoID)
 	}
 	return ""
@@ -618,7 +624,7 @@ func (h *VideoHandler) findVideoCoverPath(videoID string) string {
 		for _, directory := range directories {
 			for _, filename := range candidates {
 				path := filepath.Join(directory, filename)
-				if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Size() > 0 {
 					return path
 				}
 			}
@@ -627,9 +633,64 @@ func (h *VideoHandler) findVideoCoverPath(videoID string) string {
 	return ""
 }
 
-func (h *VideoHandler) getVideoCover(c *gin.Context) {
-	path := h.findVideoCoverPath(c.Param("id"))
+func (h *VideoHandler) findExistingVideoDirectory(videoID string) string {
+	if strings.TrimSpace(videoID) == "" || filepath.Base(videoID) != videoID {
+		return ""
+	}
+	for _, pattern := range h.getVideoDirectoryPatterns(videoID) {
+		directories, _ := filepath.Glob(pattern)
+		for _, directory := range directories {
+			if info, err := os.Stat(directory); err == nil && info.IsDir() {
+				return directory
+			}
+		}
+	}
+	return ""
+}
+
+func (h *VideoHandler) ensureVideoCoverPath(videoID string) (string, error) {
+	videoCoverRepairMu.Lock()
+	defer videoCoverRepairMu.Unlock()
+
+	if path := h.findVideoCoverPath(videoID); path != "" {
+		return path, nil
+	}
+	directory := h.findExistingVideoDirectory(videoID)
+	if directory == "" {
+		return "", fmt.Errorf("未找到视频目录")
+	}
+	proxyURL := ""
+	if h.App.Config != nil && h.App.Config.ProxyConfig != nil && h.App.Config.ProxyConfig.UseProxy {
+		proxyURL = h.App.Config.ProxyConfig.ProxyHost
+	}
+	result, ok := utils.DownloadYouTubeThumbnail(videoID, "best", utils.DownloadOptions{
+		SavePath:         directory,
+		FilenameTemplate: "{quality}",
+		Timeout:          15 * time.Second,
+		MaxRetries:       3,
+		QualityFallback:  true,
+		CreateDirs:       true,
+		Overwrite:        false,
+		ProxyURL:         proxyURL,
+	}, "cover").(utils.DownloadResult)
+	if !ok || !result.Success {
+		if ok {
+			return "", fmt.Errorf("下载封面失败: %s", result.ErrorMessage)
+		}
+		return "", fmt.Errorf("下载封面失败: 未知响应")
+	}
+	path := h.findVideoCoverPath(videoID)
 	if path == "" {
+		return "", fmt.Errorf("封面下载完成但未找到有效图片")
+	}
+	h.App.Logger.Infof("已自动修复视频封面 videoID=%s path=%s", videoID, path)
+	return path, nil
+}
+
+func (h *VideoHandler) getVideoCover(c *gin.Context) {
+	path, err := h.ensureVideoCoverPath(c.Param("id"))
+	if err != nil {
+		h.App.Logger.Warnf("获取或修复视频封面失败 videoID=%s: %v", c.Param("id"), err)
 		c.Status(http.StatusNotFound)
 		return
 	}

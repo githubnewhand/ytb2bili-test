@@ -94,17 +94,30 @@ func (t *GenerateSubtitles) Execute(context map[string]interface{}) bool {
 			_ = os.Remove(targetSrtPath)
 		}
 
-		downloader := subtitle.NewYtdlpSubtitleDownloader(t.App.Logger)
+		proxyURL := ""
+		if t.App.Config.ProxyConfig != nil && t.App.Config.ProxyConfig.UseProxy {
+			proxyURL = t.App.Config.ProxyConfig.ProxyHost
+		}
+		cookieFinder := &DownloadVideo{App: t.App}
+		downloader := subtitle.NewYtdlpSubtitleDownloader(t.App.Logger).
+			WithNetwork(proxyURL, cookieFinder.findLatestCookiesFile())
 
 		// 临时文件前缀
 		tempPrefix := filepath.Join(t.StateManager.CurrentDir, savedVideo.VideoID)
 
-		// 1. 优先尝试中文字幕
-		downloadedFile, err := downloader.DownloadChineseSubtitle(savedVideo.URL, "srt", tempPrefix)
-		if err != nil {
-			// 2. 如果没有中文，尝试英文字幕
-			t.App.Logger.Infof("未找到中文字幕，尝试英文字幕...")
+		// Ollama 翻译需要源语言字幕，优先取英文字幕。
+		var downloadedFile string
+		var err error
+		if subtitleTranslationProvider(t.App.Config) == "ollama" {
 			downloadedFile, err = downloader.DownloadEnglishSubtitle(savedVideo.URL, "srt", tempPrefix)
+			if err != nil {
+				downloadedFile, err = downloader.DownloadChineseSubtitle(savedVideo.URL, "srt", tempPrefix)
+			}
+		} else {
+			downloadedFile, err = downloader.DownloadChineseSubtitle(savedVideo.URL, "srt", tempPrefix)
+			if err != nil {
+				downloadedFile, err = downloader.DownloadEnglishSubtitle(savedVideo.URL, "srt", tempPrefix)
+			}
 		}
 
 		// 检查是否下载成功
@@ -184,7 +197,18 @@ func (t *GenerateSubtitles) Execute(context map[string]interface{}) bool {
 			t.App.Logger.Info(">>> 补办任务: 分离音频...")
 			types.ReportTaskProgress(context, 45, "分离音频")
 			extractTask := NewExtractAudio("强制分离音频", t.App, t.StateManager, t.App.CosClient)
-			extractTask.Execute(context)
+			if !extractTask.Execute(context) {
+				if _, ok := context["error"]; !ok {
+					context["error"] = "音频提取失败，无法继续生成字幕"
+				}
+				t.App.Logger.Errorf("❌ 字幕补全中止: %v", context["error"])
+				return false
+			}
+		}
+		if !nonEmptyFile(wavPath) {
+			context["error"] = fmt.Sprintf("音频提取后仍未生成有效 WAV 文件: %s", wavPath)
+			t.App.Logger.Error(context["error"])
+			return false
 		}
 
 		// 2. 执行 Whisper
@@ -200,18 +224,32 @@ func (t *GenerateSubtitles) Execute(context map[string]interface{}) bool {
 				t.App.Config.WhisperConfig.Language,
 				t.App.Config.WhisperConfig.Threads,
 			)
-			whisperTask.Execute(context)
+			if !whisperTask.Execute(context) {
+				if _, ok := context["error"]; !ok {
+					context["error"] = "Whisper 转录失败且未返回具体原因"
+				}
+				t.App.Logger.Errorf("❌ 字幕补全中止: %v", context["error"])
+				return false
+			}
 
 			// 3. 再次检查是否生成了 en.srt 等怪文件
 			for _, name := range possibleNames {
 				wrongPath := filepath.Join(t.StateManager.CurrentDir, name)
 				if info, err := os.Stat(wrongPath); err == nil && info.Size() > 0 {
-					os.Rename(wrongPath, targetSrtPath)
+					if err := os.Rename(wrongPath, targetSrtPath); err != nil {
+						context["error"] = fmt.Sprintf("Whisper 已生成字幕，但移动到目标位置失败: %v", err)
+						t.App.Logger.Error(context["error"])
+						return false
+					}
 					t.App.Logger.Infof("✅ 补全成功，已重命名文件: %s", targetSrtPath)
+					delete(context, "error")
 					types.ReportTaskProgress(context, 95, "字幕补全完成")
 					return true
 				}
 			}
+			context["error"] = "Whisper 执行完成，但没有生成非空字幕文件"
+			t.App.Logger.Error(context["error"])
+			return false
 
 			// 刷新数据库
 			savedVideo, _ = t.SavedVideoService.GetVideoByID(t.StateManager.Id)

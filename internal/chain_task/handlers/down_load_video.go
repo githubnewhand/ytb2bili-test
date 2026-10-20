@@ -39,7 +39,7 @@ type recentLineBuffer struct {
 }
 
 const (
-	downloadOverallTimeout = 4 * time.Hour
+	downloadOverallTimeout = 24 * time.Hour
 	downloadIdleTimeout    = 10 * time.Minute
 	metadataTimeout        = 2 * time.Minute
 )
@@ -108,14 +108,15 @@ func (t *DownloadVideo) findYtDlp() (string, error) {
 	// 创建 yt-dlp 管理器
 	manager := utils.NewYtDlpManager(t.App.Logger, installDir)
 
-	// 检查是否已安装
-	if manager.IsInstalled() {
-		path := manager.GetBinaryPath()
-		t.App.Logger.Debugf("找到 yt-dlp: %s", path)
-		return path, nil
+	// 服务可能长期运行，因此每次下载前都检查一次版本日期。版本仍在
+	// 90 天支持窗口内时这里只执行本地版本查询，不会访问网络。
+	if err := manager.CheckAndUpdateIfStale(90 * 24 * time.Hour); err != nil {
+		return "", fmt.Errorf("检查或更新 yt-dlp 失败: %w", err)
 	}
 
-	return "", fmt.Errorf("未找到 yt-dlp，请确保已正确安装")
+	path := manager.GetBinaryPath()
+	t.App.Logger.Debugf("找到 yt-dlp: %s", path)
+	return path, nil
 }
 
 func (t *DownloadVideo) findAria2() (string, bool) {
@@ -250,18 +251,22 @@ func (t *DownloadVideo) Execute(context map[string]interface{}) bool {
 					context["original_description"] = savedVideo.Description
 				}
 			}
-			for _, coverName := range []string{"cover.jpg", "cover.jpeg", "cover.png", "cover.webp"} {
-				coverPath := filepath.Join(t.StateManager.CurrentDir, coverName)
-				if coverInfo, err := os.Stat(coverPath); err == nil && coverInfo.Size() > 0 {
-					context["cover_image_path"] = coverPath
-					break
-				}
+			if _, err := ensureLocalVideoCover(t.App, t.StateManager, context); err != nil {
+				errMsg := fmt.Sprintf("本地视频可用，但封面准备失败: %v", err)
+				context["error"] = errMsg
+				t.App.Logger.Error(errMsg)
+				return false
 			}
 
 			types.ReportTaskProgress(context, 98, "\u590d\u7528\u5df2\u4e0b\u8f7d\u89c6\u9891")
 			t.App.Logger.Infof("Reusing existing video file without downloading: %s", existingFile)
 			return true
 		}
+	}
+
+	for _, quarantined := range quarantineCorruptCompleteVideos(t.StateManager.CurrentDir) {
+		t.App.Logger.Errorf("检测到损坏的完整媒体，已隔离并重新下载: %s", quarantined)
+		context["quarantined_corrupt_media"] = quarantined
 	}
 
 	t.App.Logger.Info("========================================")
@@ -287,27 +292,50 @@ func (t *DownloadVideo) Execute(context map[string]interface{}) bool {
 	}
 	types.ReportTaskProgress(context, 5, "准备下载目录")
 
-	// 3. 尝试下载（先用代理，失败后不用代理重试）
+	// 3. 依次尝试有无 cookies。部分公开 YouTube 视频会被过期或受限 cookies
+	// 错误地返回 Video unavailable，因此同一网络路径必须提供无 cookies 回退。
 	videoURL := t.getVideoURL()
 	useProxy := t.App.Config != nil && t.App.Config.ProxyConfig != nil &&
 		t.App.Config.ProxyConfig.UseProxy && t.App.Config.ProxyConfig.ProxyHost != ""
+	cookiesPath := t.findLatestCookiesFile()
 
-	// 第一次尝试：使用代理（如果配置了）
+	type downloadAttempt struct {
+		useProxy    bool
+		cookiesPath string
+		description string
+	}
+	attempts := make([]downloadAttempt, 0, 4)
 	if useProxy {
-		t.App.Logger.Info("🔄 尝试使用代理下载...")
-		if t.executeDownload(ytdlpPath, videoURL, true, context) {
-			return true
+		attempts = append(attempts, downloadAttempt{useProxy: true, cookiesPath: cookiesPath, description: "使用代理和 cookies"})
+		if cookiesPath != "" {
+			attempts = append(attempts, downloadAttempt{useProxy: true, description: "使用代理但不使用 cookies"})
 		}
-		t.App.Logger.Warn("⚠️ 代理下载失败，尝试不使用代理重试...")
+	}
+	attempts = append(attempts, downloadAttempt{cookiesPath: cookiesPath, description: "直连并使用 cookies"})
+	if cookiesPath != "" {
+		attempts = append(attempts, downloadAttempt{description: "直连且不使用 cookies"})
 	}
 
-	// 第二次尝试：不使用代理
-	t.App.Logger.Info("🔄 尝试不使用代理下载...")
-	return t.executeDownload(ytdlpPath, videoURL, false, context)
+	var proxyError string
+	for _, attempt := range attempts {
+		delete(context, "error")
+		t.App.Logger.Infof("尝试下载：%s", attempt.description)
+		if t.executeDownload(ytdlpPath, videoURL, attempt.useProxy, attempt.cookiesPath, context) {
+			delete(context, "error")
+			return true
+		}
+		if attempt.useProxy {
+			proxyError = fmt.Sprint(context["error"])
+		}
+	}
+	if proxyError != "" {
+		context["error"] = proxyError
+	}
+	return false
 }
 
 // executeDownload 执行实际的下载操作
-func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy bool, context map[string]interface{}) bool {
+func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy bool, cookiesPath string, context map[string]interface{}) bool {
 	// 构建下载命令
 	command := []string{
 		ytdlpPath,
@@ -318,6 +346,11 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 		"--socket-timeout", "30",
 		"--retries", "3",
 		"--fragment-retries", "3",
+	}
+
+	command = append(command, "--continue", "--part", "--no-playlist")
+	if t.App != nil && t.App.Config != nil {
+		command = append(command, downloadFormatArgs(t.App.Config.Download.MaxHeight)...)
 	}
 
 	if _, err := exec.LookPath("node"); err == nil {
@@ -335,9 +368,6 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 		)
 		t.App.Logger.Infof("🚀 使用 aria2c 加速下载: %s (%s)", aria2Path, aria2Args)
 	}
-
-	// 查找最新的 cookies 文件（优先使用用户提交的）
-	cookiesPath := t.findLatestCookiesFile()
 
 	if cookiesPath != "" {
 		command = append(command, "--cookies", cookiesPath)
@@ -363,7 +393,9 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 
 	// 创建命令并设置输出管道。yt-dlp 偶尔会卡在网络读取上，所以这里加上
 	// 总超时和空闲超时，避免一个下载永久占住整个任务链。
-	cmdCtx, cancel := stdctx.WithTimeout(stdctx.Background(), downloadOverallTimeout)
+	overallTimeout := t.overallTimeout()
+	t.App.Logger.Infof("下载最长等待时间: %s（保留断点续传缓存）", overallTimeout)
+	cmdCtx, cancel := stdctx.WithTimeout(stdctx.Background(), overallTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(cmdCtx, command[0], command[1:]...)
@@ -401,7 +433,7 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 	go t.logOutput(stderr, "ERROR", activityCh, context, recentOutput)
 
 	// 等待命令完成
-	if err := t.waitForDownload(cmd, cmdCtx, activityCh); err != nil {
+	if err := t.waitForDownload(cmd, cmdCtx, activityCh, overallTimeout); err != nil {
 		errMsg := t.formatDownloadError(err, recentOutput.String())
 		t.App.Logger.Errorf("❌ 视频下载失败: %s", errMsg)
 		context["error"] = errMsg
@@ -412,7 +444,11 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 	types.ReportTaskProgress(context, 90, "校验下载文件")
 	downloadedFile := t.findDownloadedFile()
 	if downloadedFile == "" {
-		errMsg := "下载完成但未找到视频文件"
+		quarantined := quarantineCorruptCompleteVideos(t.StateManager.CurrentDir)
+		errMsg := "下载完成但媒体完整性校验未通过"
+		if len(quarantined) > 0 {
+			errMsg = fmt.Sprintf("下载文件包含损坏数据，已隔离 %s；将使用其他下载方式重试", strings.Join(quarantined, ", "))
+		}
 		t.App.Logger.Error("❌ " + errMsg)
 		context["error"] = errMsg
 		return false
@@ -451,13 +487,21 @@ func (t *DownloadVideo) executeDownload(ytdlpPath, videoURL string, useProxy boo
 		}
 	}
 
+	types.ReportTaskProgress(context, 97, "准备视频封面")
+	if _, err := ensureLocalVideoCover(t.App, t.StateManager, context); err != nil {
+		errMsg := fmt.Sprintf("视频已下载，但封面准备失败: %v", err)
+		context["error"] = errMsg
+		t.App.Logger.Error(errMsg)
+		return false
+	}
+
 	t.App.Logger.Info("========================================")
 	types.ReportTaskProgress(context, 98, "下载步骤收尾")
 
 	return true
 }
 
-func (t *DownloadVideo) waitForDownload(cmd *exec.Cmd, cmdCtx stdctx.Context, activityCh <-chan struct{}) error {
+func (t *DownloadVideo) waitForDownload(cmd *exec.Cmd, cmdCtx stdctx.Context, activityCh <-chan struct{}, overallTimeout time.Duration) error {
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Wait()
@@ -470,7 +514,7 @@ func (t *DownloadVideo) waitForDownload(cmd *exec.Cmd, cmdCtx stdctx.Context, ac
 		select {
 		case err := <-done:
 			if cmdCtx.Err() == stdctx.DeadlineExceeded {
-				return fmt.Errorf("下载超过最长允许时间 %s，已终止", downloadOverallTimeout)
+				return fmt.Errorf("下载超过最长允许时间 %s，已终止；已保留下载缓存，可重试续传", overallTimeout)
 			}
 			return err
 		case <-activityCh:
@@ -565,7 +609,7 @@ func (t *DownloadVideo) handleDownloadOutputLine(line, level string, context map
 			t.App.Logger.Debugf("⏳ %s", line)
 			if percent, ok := parseYtDlpProgressPercent(line); ok {
 				mappedPercent := mapDownloadProgressPercent(percent)
-				types.ReportTaskProgress(context, mappedPercent, fmt.Sprintf("下载中 %d%%", percent))
+				types.ReportTaskProgress(context, mappedPercent, downloadProgressMessage(line, percent))
 			}
 		} else {
 			t.App.Logger.Infof("📥 %s", line)
@@ -582,7 +626,7 @@ func (t *DownloadVideo) handleDownloadOutputLine(line, level string, context map
 	if percent, ok := parseAria2ProgressPercent(line); ok {
 		t.App.Logger.Debugf("🚀 aria2 %s", line)
 		mappedPercent := mapDownloadProgressPercent(percent)
-		types.ReportTaskProgress(context, mappedPercent, fmt.Sprintf("aria2下载中 %d%%", percent))
+		types.ReportTaskProgress(context, mappedPercent, downloadProgressMessage(line, percent))
 		return
 	}
 
@@ -591,6 +635,49 @@ func (t *DownloadVideo) handleDownloadOutputLine(line, level string, context map
 	} else {
 		t.App.Logger.Debugf("%s", line)
 	}
+}
+
+// downloadFormatArgs applies the cap both to separate streams and combined files.
+// Omitting the cap preserves yt-dlp's normal best-quality selection.
+func downloadFormatArgs(maxHeight int) []string {
+	if maxHeight <= 0 {
+		return nil
+	}
+	return []string{"-f", fmt.Sprintf("bv*[height<=%d]+ba/b[height<=%d]", maxHeight, maxHeight)}
+}
+
+func (t *DownloadVideo) overallTimeout() time.Duration {
+	if t.App != nil && t.App.Config != nil {
+		hours := t.App.Config.Download.OverallTimeoutHours
+		// Bound the multiplication to avoid overflow from malformed configuration.
+		if hours > 0 && hours <= 8760 {
+			return time.Duration(hours) * time.Hour
+		}
+	}
+	return downloadOverallTimeout
+}
+
+var downloadSpeedPattern = regexp.MustCompile(`(?:\bat\s+|\bDL:)([0-9]+(?:\.[0-9]+)?[KMGT]?i?B(?:/s)?)`)
+var downloadETAPattern = regexp.MustCompile(`\bETA[:\s]+([0-9][0-9a-z:]*)`)
+
+// Only copy numeric progress fields to the UI, never raw output or media URLs.
+func downloadProgressMessage(line string, percent int) string {
+	progress := fmt.Sprintf("%d", percent)
+	if match := ytDlpProgressPattern.FindStringSubmatch(line); len(match) == 2 {
+		progress = match[1]
+	}
+	message := "下载中 " + progress + "%"
+	if match := downloadSpeedPattern.FindStringSubmatch(line); len(match) == 2 {
+		speed := match[1]
+		if !strings.HasSuffix(speed, "/s") {
+			speed += "/s"
+		}
+		message += " · " + speed
+	}
+	if match := downloadETAPattern.FindStringSubmatch(line); len(match) == 2 {
+		message += " · 剩余 " + match[1]
+	}
+	return message
 }
 
 func parseYtDlpProgressPercent(line string) (int, bool) {
@@ -661,38 +748,14 @@ func (t *DownloadVideo) markDownloadActivity(activityCh chan<- struct{}) {
 
 // findDownloadedFile 查找下载的视频文件
 func (t *DownloadVideo) findDownloadedFile() string {
-	// 查找目录下的 mp4 文件
-	files, err := filepath.Glob(filepath.Join(t.StateManager.CurrentDir, "*.mp4"))
-	if err != nil || len(files) == 0 {
-		// 尝试查找其他视频格式
-		for _, ext := range []string{"*.webm", "*.mkv", "*.flv"} {
-			files, err = filepath.Glob(filepath.Join(t.StateManager.CurrentDir, ext))
-			if err == nil && len(files) > 0 {
-				break
-			}
+	file, err := findCompleteVideo(t.StateManager.CurrentDir)
+	if err != nil {
+		if t.App != nil && t.App.Logger != nil {
+			t.App.Logger.Warnf("下载文件完整性校验未通过: %v", err)
 		}
+		return ""
 	}
-
-	if len(files) > 0 {
-		// 返回最新的文件
-		latestFile := files[0]
-		latestTime := int64(0)
-
-		for _, file := range files {
-			info, err := os.Stat(file)
-			if err != nil {
-				continue
-			}
-			if info.ModTime().Unix() > latestTime {
-				latestTime = info.ModTime().Unix()
-				latestFile = file
-			}
-		}
-
-		return latestFile
-	}
-
-	return ""
+	return file
 }
 
 // VideoMetadataInfo 视频元数据信息
@@ -706,58 +769,68 @@ type VideoMetadataInfo struct {
 // getVideoMetadata 使用 yt-dlp 获取视频元数据（带代理回退）
 func (t *DownloadVideo) getVideoMetadata(ytdlpPath string) (*VideoMetadataInfo, error) {
 	videoURL := t.getVideoURL()
-
-	// 构建基础命令参数
 	baseArgs := []string{"--dump-json", "--no-download"}
 	if _, err := exec.LookPath("node"); err == nil {
 		baseArgs = append(baseArgs, "--js-runtimes", "node")
 	}
 
-	// 添加 cookies 支持（使用最新的用户提交的 cookies）
 	cookiesPath := t.findLatestCookiesFile()
-
-	if cookiesPath != "" {
-		baseArgs = append(baseArgs, "--cookies", cookiesPath)
-		t.App.Logger.Debugf("🍪 使用 Cookies 文件获取元数据: %s", cookiesPath)
-	} else {
-		t.App.Logger.Debug("No cookies file found; fetching metadata without cookies")
+	proxyURL := ""
+	if t.App.Config != nil && t.App.Config.ProxyConfig != nil &&
+		t.App.Config.ProxyConfig.UseProxy {
+		proxyURL = t.App.Config.ProxyConfig.ProxyHost
 	}
 
-	// 尝试使用代理
-	useProxy := t.App.Config != nil && t.App.Config.ProxyConfig != nil &&
-		t.App.Config.ProxyConfig.UseProxy && t.App.Config.ProxyConfig.ProxyHost != ""
-
-	args := append([]string{}, baseArgs...)
-	if useProxy {
-		args = append(args, "--proxy", t.App.Config.ProxyConfig.ProxyHost)
-		t.App.Logger.Debugf("📡 使用代理获取元数据: %s", t.App.Config.ProxyConfig.ProxyHost)
+	type metadataAttempt struct {
+		proxyURL    string
+		cookiesPath string
+		description string
 	}
-
-	args = append(args, videoURL)
-
-	// 第一次尝试（可能带代理）
-	output, err := t.runYtDlpOutput(ytdlpPath, args, metadataTimeout)
-
-	// 如果使用代理失败，尝试不使用代理
-	if err != nil && useProxy {
-		t.App.Logger.Warnf("⚠️ 使用代理获取元数据失败，尝试不使用代理...")
-		argsNoProxy := append([]string{}, baseArgs...)
-		argsNoProxy = append(argsNoProxy, videoURL)
-		output, err = t.runYtDlpOutput(ytdlpPath, argsNoProxy, metadataTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("获取元数据失败: %v", err)
+	attempts := make([]metadataAttempt, 0, 4)
+	if proxyURL != "" {
+		attempts = append(attempts, metadataAttempt{proxyURL: proxyURL, cookiesPath: cookiesPath, description: "使用代理和 cookies"})
+		if cookiesPath != "" {
+			attempts = append(attempts, metadataAttempt{proxyURL: proxyURL, description: "使用代理但不使用 cookies"})
 		}
-		t.App.Logger.Info("✓ 不使用代理成功获取元数据")
-	} else if err != nil {
-		return nil, fmt.Errorf("获取元数据失败: %v", err)
+	}
+	attempts = append(attempts, metadataAttempt{cookiesPath: cookiesPath, description: "直连并使用 cookies"})
+	if cookiesPath != "" {
+		attempts = append(attempts, metadataAttempt{description: "直连且不使用 cookies"})
 	}
 
-	var metadata VideoMetadataInfo
-	if err := json.Unmarshal(output, &metadata); err != nil {
-		return nil, fmt.Errorf("解析元数据失败: %v", err)
+	var lastErr error
+	var proxyErr error
+	for _, attempt := range attempts {
+		args := append([]string{}, baseArgs...)
+		if attempt.cookiesPath != "" {
+			args = append(args, "--cookies", attempt.cookiesPath)
+		}
+		if attempt.proxyURL != "" {
+			args = append(args, "--proxy", attempt.proxyURL)
+		}
+		args = append(args, videoURL)
+
+		t.App.Logger.Debugf("获取视频元数据：%s", attempt.description)
+		output, err := t.runYtDlpOutput(ytdlpPath, args, metadataTimeout)
+		if err != nil {
+			lastErr = err
+			if attempt.proxyURL != "" {
+				proxyErr = err
+			}
+			continue
+		}
+
+		var metadata VideoMetadataInfo
+		if err := json.Unmarshal(output, &metadata); err != nil {
+			return nil, fmt.Errorf("解析元数据失败: %v", err)
+		}
+		return &metadata, nil
 	}
 
-	return &metadata, nil
+	if proxyErr != nil {
+		return nil, fmt.Errorf("获取元数据失败: %v", proxyErr)
+	}
+	return nil, fmt.Errorf("获取元数据失败: %v", lastErr)
 }
 
 func (t *DownloadVideo) runYtDlpOutput(ytdlpPath string, args []string, timeout time.Duration) ([]byte, error) {

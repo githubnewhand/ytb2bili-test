@@ -39,6 +39,8 @@ FileUpDir = "/Users/apple/opt/file_upload/media"  # 文件上传目录（绝对�
 # 下载配置
 # ======================
 [download]
+  overall_timeout_hours = 24  # 每次尝试的总时限；适合慢速网络，仍保留 10 分钟无输出保护
+  max_height = 0  # 0=最高画质，1080=最高1080p，720=最高720p
   use_aria2 = false
   aria2_path = ""  # 留空则从 PATH 查找 aria2c
   aria2_args = "-x 16 -s 16 -k 1M --file-allocation=none"
@@ -78,3 +80,17 @@ FileUpDir = "/Users/apple/opt/file_upload/media"  # 文件上传目录（绝对�
 # 3. app_auth - 应用启动认证
 #
 # 详细说明请参考: docs/CONFIG_GUIDE.md
+
+# 字幕翻译专用配置；Ollama 使用本机地址，不经过 ProxyConfig。
+[SubtitleTranslationConfig]
+provider = "deepseek"
+ollama_url = "http://127.0.0.1:11434"
+ollama_model = "qwen3:4b-instruct"
+timeout = 180
+
+# 正式元数据步骤；auto 保持原 Gemini/DeepSeek 路线，ollama 使用本机模型。
+[MetadataGenerationConfig]
+provider = "auto"
+ollama_url = "http://127.0.0.1:11434"
+ollama_model = "qwen3:4b-instruct"
+timeout = 180
