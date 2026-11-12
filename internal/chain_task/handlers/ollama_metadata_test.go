@@ -36,7 +36,7 @@ func TestFormalMetadataHandlerUsesOllamaAndWritesFileOnly(t *testing.T) {
 			if req.Model != "qwen3:4b-instruct" || req.Format != "json" || req.Think {
 				t.Errorf("invalid Ollama request: %+v", req)
 			}
-			fmt.Fprint(w, `{"message":{"content":"{\"title\":\"助眠理发\",\"description\":\"这是一段私人理发主题的助眠视频，中文字幕来自自动识别内容，可能存在误差。\",\"tags\":[\"ASMR\",\"理发\",\"助眠\"]}"}}`)
+			fmt.Fprint(w, `{"message":{"content":"{\"title\":\"助眠理发\",\"description\":\"这是一段私人理发主题的助眠视频，通过轻柔的交流营造放松氛围。\",\"tags\":[\"ASMR\",\"理发\",\"助眠\"]}"}}`)
 		default:
 			t.Errorf("unexpected route: %s", r.URL.Path)
 		}
@@ -69,7 +69,7 @@ func TestFormalMetadataHandlerUsesOllamaAndWritesFileOnly(t *testing.T) {
 	if err := json.Unmarshal(data, &saved); err != nil {
 		t.Fatal(err)
 	}
-	if saved.Title != "助眠理发" || len(saved.Tags) != 3 {
+	if saved.Title != "助眠理发" || len(saved.Tags) != 3 || strings.Contains(saved.Description, "字幕") {
 		t.Fatalf("unexpected meta.json: %s", data)
 	}
 }

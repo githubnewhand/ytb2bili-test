@@ -172,62 +172,7 @@ func (g *GenerateMetadata) executeWithDeepSeek(context map[string]interface{}) b
 		return false
 	}
 
-	// 6. 验证标题长度（Bilibili限制80字符）
-	if len([]rune(metadata.Title)) > 80 {
-		runes := []rune(metadata.Title)
-		metadata.Title = string(runes[:77]) + "..."
-		g.App.Logger.Warnf("⚠️  标题过长，已截断为80字符")
-	}
-
-	// 7. 保存到 context
-	context["video_title"] = metadata.Title
-	context["video_description"] = metadata.Description
-	context["video_tags"] = metadata.Tags
-
-	// 8. 保存到 meta.json 文件
-	g.App.Logger.Info("💾 保存元数据到 meta.json 文件...")
-	types.ReportTaskProgress(context, 80, "保存元数据文件")
-	if err := g.saveMetadataToFile(metadata); err != nil {
-		g.App.Logger.Errorf("❌ 保存 meta.json 文件失败: %v", err)
-		context["error"] = fmt.Sprintf("生成元数据失败：保存 meta.json 失败: %v", err)
-		return false
-	} else {
-		g.App.Logger.Info("✅ meta.json 文件已保存")
-	}
-
-	// 9. 保存到数据库
-	g.App.Logger.Info("💾 保存生成的元数据到数据库...")
-	types.ReportTaskProgress(context, 90, "写入元数据到数据库")
-	savedVideo, err := g.SavedVideoService.GetVideoByVideoID(g.StateManager.VideoID)
-	if err != nil {
-		g.App.Logger.Errorf("❌ 获取视频记录失败: %v", err)
-		context["error"] = fmt.Sprintf("生成元数据失败：获取视频记录失败: %v", err)
-		return false
-	} else {
-		// 更新生成的元数据
-		savedVideo.GeneratedTitle = metadata.Title
-		savedVideo.GeneratedDesc = metadata.Description
-		savedVideo.GeneratedTags = strings.Join(metadata.Tags, ",")
-
-		if err := g.SavedVideoService.UpdateVideo(savedVideo); err != nil {
-			g.App.Logger.Errorf("❌ 保存元数据到数据库失败: %v", err)
-			context["error"] = fmt.Sprintf("生成元数据失败：保存元数据到数据库失败: %v", err)
-			return false
-		} else {
-			g.App.Logger.Info("✅ 元数据已保存到数据库")
-		}
-	}
-
-	// 10. 输出生成结果
-	g.App.Logger.Info("========================================")
-	g.App.Logger.Info("✅ 视频元数据生成成功！")
-	g.App.Logger.Infof("📌 标题: %s", metadata.Title)
-	g.App.Logger.Infof("📝 描述: %s", g.truncateString(metadata.Description, 100))
-	g.App.Logger.Infof("🏷️  标签: %v", metadata.Tags)
-	g.App.Logger.Info("========================================")
-	types.ReportTaskProgress(context, 98, "元数据生成完成")
-
-	return true
+	return g.saveMetadataResults(metadata, context)
 }
 
 // extractTextFromSRT 从SRT内容中提取纯文本
@@ -279,7 +224,7 @@ func (g *GenerateMetadata) generateMetadataFromDeepSeek(subtitleText string) (*V
 请直接返回JSON格式的结果，不要包含任何其他说明文字。`, subtitleText)
 
 	// 使用 DeepSeekClient 调用 API
-	content, usage, err := g.requestMetadataJSON("你是一个专业的视频内容分析助手，擅长根据视频字幕生成吸引人的标题和描述。", prompt)
+	content, usage, err := g.requestMetadataJSON("你是一个专业的视频内容分析助手。"+metadataContentOnlyRules, prompt)
 	if err != nil {
 		return nil, fmt.Errorf("调用 DeepSeek API 失败: %v", err)
 	}
@@ -332,15 +277,15 @@ func (g *GenerateMetadata) requestMetadataJSON(systemPrompt, prompt string) (str
 		var err error
 
 		if jsonMode {
-			content, usage, finishReason, err = g.DeepSeekClient.ChatCompletionJSONWithUsage(systemPrompt, prompt)
+			content, usage, finishReason, err = g.DeepSeekClient.ChatCompletionJSONWithUsage(systemPrompt, metadataRetryPrompt(prompt, lastErr))
 			if err != nil && isJSONModeUnsupported(err) {
 				g.App.Logger.Warn("DeepSeek端点不支持JSON模式，改用提示词约束模式")
 				jsonMode = false
-				content, usage, err = g.DeepSeekClient.ChatCompletionWithUsage(systemPrompt, prompt)
+				content, usage, err = g.DeepSeekClient.ChatCompletionWithUsage(systemPrompt, metadataRetryPrompt(prompt, lastErr))
 				finishReason = ""
 			}
 		} else {
-			content, usage, err = g.DeepSeekClient.ChatCompletionWithUsage(systemPrompt, prompt)
+			content, usage, err = g.DeepSeekClient.ChatCompletionWithUsage(systemPrompt, metadataRetryPrompt(prompt, lastErr))
 		}
 
 		if err != nil {
@@ -401,7 +346,7 @@ func validateGeneratedMetadata(metadata *VideoMetadata) error {
 	if len(metadata.Tags) > 5 {
 		return fmt.Errorf("生成的标签超过5个")
 	}
-	return nil
+	return validateMetadataContentOnly(metadata)
 }
 
 func isJSONModeUnsupported(err error) bool {
@@ -423,6 +368,9 @@ func metadataContentPreview(content string, maxRunes int) string {
 
 // saveMetadataToFile 保存元数据到 meta.json 文件
 func (g *GenerateMetadata) saveMetadataToFile(metadata *VideoMetadata) error {
+	if err := validateGeneratedMetadata(metadata); err != nil {
+		return err
+	}
 	// 构建文件路径
 	metaFilePath := filepath.Join(g.StateManager.CurrentDir, "meta.json")
 
@@ -589,6 +537,10 @@ func (g *GenerateMetadata) executeWithGeminiText(taskContext map[string]interfac
 
 // saveMetadataResults 保存元数据结果到context和数据库
 func (g *GenerateMetadata) saveMetadataResults(metadata *VideoMetadata, taskContext map[string]interface{}) bool {
+	if err := validateGeneratedMetadata(metadata); err != nil {
+		taskContext["error"] = fmt.Sprintf("生成元数据未通过内容校验: %v", err)
+		return false
+	}
 	// 1. 验证标题长度
 	if len([]rune(metadata.Title)) > 80 {
 		runes := []rune(metadata.Title)

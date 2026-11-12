@@ -121,19 +121,16 @@ func (g *GeminiClient) GenerateMetadataFromVideo(ctx context.Context, videoFile 
 
 请直接返回JSON格式的结果，不要包含任何其他说明文字。`
 
-	resp, err := model.GenerateContent(ctx, genai.FileData{URI: videoFile.URI}, genai.Text(prompt))
-	if err != nil {
-		return nil, fmt.Errorf("生成内容失败: %v", err)
-	}
-
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("未生成任何内容")
-	}
-
-	// 提取文本内容
-	content := fmt.Sprintf("%v", resp.Candidates[0].Content.Parts[0])
-
-	return parseMetadataJSON(content)
+	return requestContentOnlyMetadata(prompt+"\n"+metadataContentOnlyRules, func(currentPrompt string) (string, error) {
+		resp, err := model.GenerateContent(ctx, genai.FileData{URI: videoFile.URI}, genai.Text(currentPrompt))
+		if err != nil {
+			return "", fmt.Errorf("生成内容失败: %w", err)
+		}
+		if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
+			return "", fmt.Errorf("未生成任何内容")
+		}
+		return fmt.Sprintf("%v", resp.Candidates[0].Content.Parts[0]), nil
+	})
 }
 
 // GenerateMetadataFromText 从文本生成元数据（用于字幕）
@@ -164,19 +161,16 @@ func (g *GeminiClient) GenerateMetadataFromText(ctx context.Context, subtitleTex
 
 请直接返回JSON格式的结果，不要包含任何其他说明文字。`, subtitleText)
 
-	resp, err := model.GenerateContent(ctx, genai.Text(prompt))
-	if err != nil {
-		return nil, fmt.Errorf("生成内容失败: %v", err)
-	}
-
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("未生成任何内容")
-	}
-
-	// 提取文本内容
-	content := fmt.Sprintf("%v", resp.Candidates[0].Content.Parts[0])
-
-	return parseMetadataJSON(content)
+	return requestContentOnlyMetadata(prompt+"\n"+metadataContentOnlyRules, func(currentPrompt string) (string, error) {
+		resp, err := model.GenerateContent(ctx, genai.Text(currentPrompt))
+		if err != nil {
+			return "", fmt.Errorf("生成内容失败: %w", err)
+		}
+		if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
+			return "", fmt.Errorf("未生成任何内容")
+		}
+		return fmt.Sprintf("%v", resp.Candidates[0].Content.Parts[0]), nil
+	})
 }
 
 // parseMetadataJSON 解析 JSON 格式的元数据
@@ -200,8 +194,8 @@ func parseMetadataJSON(content string) (*VideoMetadata, error) {
 	}
 
 	// 验证必填字段
-	if metadata.Title == "" {
-		return nil, fmt.Errorf("生成的标题为空")
+	if err := validateGeneratedMetadata(&metadata); err != nil {
+		return nil, err
 	}
 
 	return &metadata, nil

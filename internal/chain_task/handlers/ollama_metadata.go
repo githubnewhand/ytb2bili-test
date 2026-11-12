@@ -70,11 +70,11 @@ func (g *GenerateMetadata) originalTitleForMetadata() string {
 }
 
 func (g *GenerateMetadata) generateMetadataFromOllama(endpoint, model string, timeout time.Duration, subtitleText, originalTitle string) (*VideoMetadata, error) {
-	system := "你是谨慎的中文视频编辑。原视频标题比自动识别字幕更可靠。只概述标题和字幕共同支持的主题；不要引用对话、列举识别错词、推测具体手法或用品，也不要编造人物身份、效果或外部链接。只输出JSON对象。"
-	prompt := fmt.Sprintf("原视频标题：%s\n中文字幕摘录（依时间顺序，含开头、中段和末段）：%s\n请返回JSON对象，字段为title、description、tags。title不超过30个汉字；description为80至160字的中文简介，只写主题和观看体验，并用一句话说明字幕可能有自动识别误差；不要写具体操作技术、发型分析、错词例子或字幕原句；tags为3至5个简短中文标签。不要写任何网址，原视频链接由上传程序单独添加。", originalTitle, subtitleText)
+	system := "你是谨慎的中文视频编辑，不编造人物身份、效果或外部链接。" + metadataContentOnlyRules
+	prompt := fmt.Sprintf("原视频标题：%s\n中文字幕摘录（依时间顺序，含开头、中段和末段）：%s\n请返回JSON对象，字段为title、description、tags。title不超过30个汉字；description为80至160字的中文简介，只写主题和观看体验，不添加字幕、转录或翻译说明；只保留材料能够支持的内容，不引用错词例子或字幕原句；tags为3至5个简短中文标签。不要写任何网址，原视频链接由上传程序单独添加。", originalTitle, subtitleText)
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		content, err := callOllamaJSON(endpoint, model, timeout, system, prompt)
+		content, err := callOllamaJSON(endpoint, model, timeout, system, metadataRetryPrompt(prompt, lastErr))
 		if err != nil {
 			lastErr = err
 			continue
@@ -99,10 +99,6 @@ func (g *GenerateMetadata) generateMetadataFromOllama(endpoint, model string, ti
 		}
 		metadata.Title = strings.TrimSpace(metadata.Title)
 		metadata.Description = strings.TrimSpace(metadata.Description)
-		metadata.Description = strings.ReplaceAll(metadata.Description, "实际内容以视频标题为准", "请以原视频为准")
-		if !strings.Contains(metadata.Description, "字幕") {
-			metadata.Description += " 中文字幕由自动翻译生成，可能有误，请以原视频为准。"
-		}
 		for i := range metadata.Tags {
 			metadata.Tags[i] = strings.TrimSpace(metadata.Tags[i])
 		}
