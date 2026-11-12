@@ -629,15 +629,20 @@ func (t *UploadToBilibili) buildStudioInfo(video *bilibili.Video, coverURL strin
 // truncateString 截断字符串用于日志显示
 
 func (t *UploadToBilibili) newUploadClient(loginInfo *bilibili.LoginInfo, extraOptions ...bilibili.Option) *bilibili.UploadClient {
-	options := bilibiliutil.BuildOptions(t.App.Config, bilibiliUploadAPITimeout)
+	options := bilibiliutil.VideoUploadOptions(bilibiliUploadAPITimeout)
 	options = append(options, extraOptions...)
 	return bilibili.NewUploadClient(loginInfo, options...)
 }
 
 func (t *UploadToBilibili) uploadVideoWithRetry(loginInfo *bilibili.LoginInfo, videoPath string, context map[string]interface{}) (*bilibili.Video, error) {
 	var uploadedVideo *bilibili.Video
+	attempt := 0
 	err := t.retryUploadOperation("\u4e0a\u4f20\u89c6\u9891", bilibiliVideoUploadMaxAttempts, func() error {
-		client := t.newUploadClient(loginInfo, bilibili.WithUploadProgress(func(progress bilibili.UploadProgress) {
+		routes := []string{"ws", "qn", "bda2"}
+		route := routes[attempt%len(routes)]
+		attempt++
+		types.ReportTaskProgress(context, 0, fmt.Sprintf("建立直连上传（线路 %d/%d）", attempt, len(routes)))
+		client := t.newUploadClient(loginInfo, bilibili.WithUploadCDN(route), bilibili.WithUploadProgress(func(progress bilibili.UploadProgress) {
 			percent := int(progress.Percent + 0.5)
 			if percent < 0 {
 				percent = 0
@@ -649,6 +654,9 @@ func (t *UploadToBilibili) uploadVideoWithRetry(loginInfo *bilibili.LoginInfo, v
 			message := fmt.Sprintf("上传视频文件 %d%%", percent)
 			if progress.TotalChunks > 0 && progress.ChunkIndex > 0 {
 				message = fmt.Sprintf("上传视频文件 %d%%（分片 %d/%d）", percent, progress.ChunkIndex, progress.TotalChunks)
+			}
+			if progress.Message != "" {
+				message = progress.Message
 			}
 			types.ReportTaskProgress(context, percent, message)
 		}))
@@ -786,7 +794,7 @@ func (t *UploadToBilibili) truncateTitle(title string, maxLen int) string {
 
 // getUserFriendlyError 将技术错误转换为用户友好的错误信息
 func (t *UploadToBilibili) getUserFriendlyError(err error, operation string) string {
-	errorStr := err.Error()
+	errorStr := strings.ToLower(err.Error())
 
 	// 网络相关错误
 	if strings.Contains(errorStr, "broken pipe") || strings.Contains(errorStr, "connection reset") {
@@ -819,19 +827,19 @@ func (t *UploadToBilibili) getUserFriendlyError(err error, operation string) str
 	}
 
 	// B站API相关错误
-	if strings.Contains(errorStr, "401") || strings.Contains(errorStr, "unauthorized") {
+	if uploadErrorStatus(errorStr, "401") || strings.Contains(errorStr, "unauthorized") {
 		return fmt.Sprintf("%s失败：登录状态已过期，请重新登录", operation)
 	}
 
-	if strings.Contains(errorStr, "403") || strings.Contains(errorStr, "forbidden") {
+	if uploadErrorStatus(errorStr, "403") || strings.Contains(errorStr, "forbidden") {
 		return fmt.Sprintf("%s失败：账号权限不足或被限制", operation)
 	}
 
-	if strings.Contains(errorStr, "429") || strings.Contains(errorStr, "rate limit") {
+	if uploadErrorStatus(errorStr, "429") || strings.Contains(errorStr, "rate limit") {
 		return fmt.Sprintf("%s失败：操作频率过快，请稍后再试", operation)
 	}
 
-	if strings.Contains(errorStr, "500") || strings.Contains(errorStr, "internal server error") {
+	if uploadErrorStatus(errorStr, "500") || strings.Contains(errorStr, "internal server error") {
 		return fmt.Sprintf("%s失败：B站服务器临时异常，请稍后重试", operation)
 	}
 
@@ -846,4 +854,9 @@ func (t *UploadToBilibili) getUserFriendlyError(err error, operation string) str
 
 	// 如果是未知错误，返回简化的错误信息
 	return fmt.Sprintf("%s失败：发生未知错误，请重试或联系技术支持", operation)
+}
+
+// Match status/code fields, never digits embedded in a URL, upload ID or size.
+func uploadErrorStatus(message, code string) bool {
+	return regexp.MustCompile(`(?i)(?:status(?:\s+code)?[ :=]+|http(?:/\d(?:\.\d)?)?[ :=]+|code[=:]\s*)` + code + `(?:\b|$)`).MatchString(message)
 }

@@ -14,6 +14,7 @@ type Config struct {
 	Timeout        time.Duration
 	ProxyURL       string
 	UploadProgress UploadProgressCallback
+	UploadCDN      string
 }
 
 // Option SDK????
@@ -21,6 +22,7 @@ type Option func(*Config)
 
 // UploadProgress 上传进度信息
 type UploadProgress struct {
+	Message       string
 	UploadedBytes int64
 	TotalBytes    int64
 	ChunkIndex    int
@@ -110,3 +112,6 @@ func (c *Config) ApplyOptions(opts ...Option) {
 	c.HTTPClient.Timeout = c.Timeout
 	applyProxyTransport(c.HTTPClient, c.ProxyURL)
 }
+
+// WithUploadCDN selects a storage route when requesting a new upload session.
+func WithUploadCDN(cdn string) Option { return func(c *Config) { c.UploadCDN = cdn } }

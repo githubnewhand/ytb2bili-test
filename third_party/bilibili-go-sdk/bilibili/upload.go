@@ -1,10 +1,12 @@
 package bilibili
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +21,7 @@ type UploadClient struct {
 	uploadClient   *http.Client // ??????? HTTP ????????????
 	loginInfo      *LoginInfo
 	uploadProgress UploadProgressCallback
+	uploadCDN      string
 }
 
 func buildUploadTransport(proxyURL string) *http.Transport {
@@ -27,6 +30,18 @@ func buildUploadTransport(proxyURL string) *http.Transport {
 	transport.MaxIdleConnsPerHost = 5
 	transport.IdleConnTimeout = 30 * time.Second
 	transport.DisableCompression = true
+	transport.Proxy = nil
+	transport.ForceAttemptHTTP2 = false
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	transport.TLSHandshakeTimeout = 20 * time.Second
+	transport.ResponseHeaderTimeout = 30 * time.Second
 
 	if proxyURL != "" {
 		parsedURL, err := url.Parse(proxyURL)
@@ -44,7 +59,7 @@ func NewUploadClient(loginInfo *LoginInfo, opts ...Option) *UploadClient {
 	config.ApplyOptions(opts...)
 
 	uploadClient := &http.Client{
-		Timeout:   15 * time.Minute, // ???????15??
+		Timeout:   2 * time.Minute, // ???????15??
 		Transport: buildUploadTransport(config.ProxyURL),
 	}
 
@@ -53,6 +68,7 @@ func NewUploadClient(loginInfo *LoginInfo, opts ...Option) *UploadClient {
 		uploadClient:   uploadClient,
 		loginInfo:      loginInfo,
 		uploadProgress: config.UploadProgress,
+		uploadCDN:      config.UploadCDN,
 	}
 }
 
@@ -91,6 +107,9 @@ func retryFunc(fn func() error) error {
 
 // UploadVideo ??????
 func (uc *UploadClient) UploadVideo(videoPath string) (*Video, error) {
+	return uc.withUploadRoutes(func() (*Video, error) { return uc.uploadVideoOnce(videoPath) })
+}
+func (uc *UploadClient) uploadVideoOnce(videoPath string) (*Video, error) {
 	// 1. ??????
 	fileInfo, err := os.Stat(videoPath)
 	if err != nil {
@@ -144,6 +163,9 @@ func (uc *UploadClient) UploadVideo(videoPath string) (*Video, error) {
 
 // UploadVideoFromURL ? URL ??????? Bilibili?????????
 func (uc *UploadClient) UploadVideoFromURL(videoURL, fileName string, fileSize int64) (*Video, error) {
+	return uc.withUploadRoutes(func() (*Video, error) { return uc.uploadVideoFromURLOnce(videoURL, fileName, fileSize) })
+}
+func (uc *UploadClient) uploadVideoFromURLOnce(videoURL, fileName string, fileSize int64) (*Video, error) {
 	log.Printf("Uploading video from URL: %s, filename: %s, size: %d bytes", videoURL, fileName, fileSize)
 
 	// 1. ???????
@@ -184,4 +206,26 @@ func (uc *UploadClient) UploadVideoFromURL(videoURL, fileName string, fileSize i
 	log.Printf("Upload from URL completed. Video filename: %s, title: %s", video.Filename, video.Title)
 
 	return video, nil
+}
+
+func (uc *UploadClient) withUploadRoutes(fn func() (*Video, error)) (*Video, error) {
+	if uc.uploadCDN != "" {
+		return fn()
+	}
+	defer func() { uc.uploadCDN = "" }()
+	var last error
+	for index, route := range []string{"ws", "qn", "bda2"} {
+		uc.uploadCDN = route
+		video, err := fn()
+		if err == nil {
+			return video, nil
+		}
+		last = err
+		text := strings.ToLower(err.Error())
+		if !IsNetworkError(err) && !strings.Contains(text, "status 5") && !strings.Contains(text, "protocol_error") {
+			return nil, err
+		}
+		log.Printf("Upload storage route %d failed; requesting another route", index+1)
+	}
+	return nil, last
 }
