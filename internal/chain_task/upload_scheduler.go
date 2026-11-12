@@ -28,6 +28,7 @@ type UploadScheduler struct {
 	Db                *gorm.DB
 	Task              *cron.Cron
 	mutex             sync.Mutex
+	subtitleMutex     sync.Mutex
 	logger            *zap.SugaredLogger
 
 	// 上传队列跟踪
@@ -68,12 +69,24 @@ func (s *UploadScheduler) SetUp() {
 			s.lastVideoUploadTime = time.Now()
 		}
 
-		// 字幕上传改为手动触发（失败后由前端重试按钮触发）
 	}); err != nil {
 		s.logger.Errorf("failed to register public upload scheduler: %v", err)
 		return
 	}
 
+	// Use a separate job so a long video upload cannot delay due subtitles.
+	if _, err := s.Task.AddFunc("@every 1m", func() {
+		if !s.subtitleMutex.TryLock() {
+			return
+		}
+		defer s.subtitleMutex.Unlock()
+		if err := s.uploadNextSubtitle(); err != nil {
+			s.logger.Errorf("自动上传字幕失败: %v", err)
+		}
+	}); err != nil {
+		s.logger.Errorf("failed to register subtitle upload scheduler: %v", err)
+		return
+	}
 	s.logger.Info("✓ Upload scheduler started, checking every minute")
 }
 
@@ -145,41 +158,61 @@ func (s *UploadScheduler) uploadNextVideo() error {
 	return nil
 }
 
+const subtitleRetryDelay = 15 * time.Minute
+
+type subtitleUploadCandidate struct {
+	ID                                     uint
+	VideoID, Title, Status, SubtitleStatus string
+	UpdatedAt, UploadedAt                  time.Time
+}
+
+func (v subtitleUploadCandidate) due(now time.Time) bool {
+	if v.UploadedAt.IsZero() || now.Before(v.UploadedAt.Add(autoUploadDelay)) {
+		return false
+	}
+	if v.SubtitleStatus == "completed" || v.SubtitleStatus == "running" {
+		return false
+	}
+	return v.Status == "300" || (v.Status == "399" && !now.Before(v.UpdatedAt.Add(subtitleRetryDelay)))
+}
+
 // uploadNextSubtitle 上传下一个待上传字幕的视频
 func (s *UploadScheduler) uploadNextSubtitle() error {
-	// 查询状态为 '300' (视频已上传，待上传字幕) 且上传时间超过1小时的视频
-	var videos []struct {
-		ID        uint
-		VideoID   string
-		Title     string
-		UpdatedAt time.Time
-		CreatedAt time.Time
-	}
-
-	oneHourAgo := time.Now().Add(-time.Hour)
-
-	err := s.Db.Model(&model.SavedVideo{}).
-		Select("id, video_id, title, updated_at, created_at").
-		Where("status = ? AND updated_at <= ?", "300", oneHourAgo).
-		Order("updated_at ASC").
-		Limit(1).
-		Find(&videos).Error
-
+	var videos []subtitleUploadCandidate
+	err := s.Db.Table("tb_saved_videos AS v").
+		Select("v.id, v.video_id, v.title, v.status, v.updated_at, COALESCE(u.end_time, u.updated_at) AS uploaded_at, COALESCE(sub.status, '') AS subtitle_status").
+		Joins("JOIN tb_task_steps AS u ON u.video_id = v.video_id AND u.step_name = ? AND u.status = ? AND u.deleted_at IS NULL", "上传到Bilibili", "completed").
+		Joins("LEFT JOIN tb_task_steps AS sub ON sub.video_id = v.video_id AND sub.step_name = ? AND sub.deleted_at IS NULL", "上传字幕到Bilibili").
+		Where("v.deleted_at IS NULL AND v.status IN ?", []string{"300", "399"}).
+		Order("COALESCE(u.end_time, u.updated_at) ASC").Find(&videos).Error
 	if err != nil {
-		return fmt.Errorf("查询待上传字幕的视频失败: %v", err)
+		return fmt.Errorf("查询待上传字幕的视频失败: %w", err)
 	}
-
-	if len(videos) == 0 {
-		s.logger.Debug("没有待上传字幕的视频")
+	var video subtitleUploadCandidate
+	found := false
+	for _, candidate := range videos {
+		if candidate.due(time.Now()) {
+			video = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
 		return nil
 	}
-
-	video := videos[0]
 	s.logger.Infof("📝 开始上传字幕: %s (VideoID: %s)", video.Title, video.VideoID)
 
-	// 更新状态为 '301' (上传字幕中)
-	if err := s.SavedVideoService.UpdateStatus(video.ID, "301"); err != nil {
-		return fmt.Errorf("更新视频状态失败: %v", err)
+	// Claim atomically; another tick/manual request may have already taken it.
+	claim := s.Db.Model(&model.SavedVideo{}).Where("id = ? AND status = ?", video.ID, video.Status).Update("status", "301")
+	if claim.Error != nil {
+		return claim.Error
+	}
+	if claim.RowsAffected == 0 {
+		return nil
+	}
+	if err := s.TaskStepService.InitTaskSteps(video.VideoID); err != nil {
+		s.SavedVideoService.UpdateStatus(video.ID, "399")
+		return err
 	}
 
 	// 执行上传字幕任务
@@ -230,7 +263,7 @@ func (s *UploadScheduler) executeUploadTask(videoID, taskName string) error {
 		chain.AddTask(handlers.NewUploadToBilibili("上传到Bilibili", s.App, stateManager, s.App.CosClient, s.SavedVideoService))
 	case "上传字幕到Bilibili":
 		chain.AddTask(handlers.NewUploadSubtitleToBilibili("上传字幕到Bilibili", s.App, stateManager, s.App.CosClient, s.SavedVideoService))
-		chain.AddTask(handlers.NewPublishCommentHandler("发布章节评论", s.App, stateManager, s.App.CosClient, s.SavedVideoService))
+		// Subtitle completion is independent of publishing chapter comments.
 	default:
 		return fmt.Errorf("未知的任务类型: %s", taskName)
 	}

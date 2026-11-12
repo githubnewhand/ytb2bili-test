@@ -46,6 +46,11 @@ jobs:
         cmake --build /tmp/whisper-build --target whisper --parallel 2
         sudo cmake --install /tmp/whisper-build
 
+    - name: Install FFmpeg for media tests
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ffmpeg
+
     - name: Run tests
       run: go test -v ./...
 

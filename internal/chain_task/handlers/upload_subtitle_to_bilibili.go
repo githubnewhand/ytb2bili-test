@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/difyz9/bilibili-go-sdk/bilibili"
 	"github.com/difyz9/ytb2bili/internal/bilibiliutil"
@@ -95,7 +94,12 @@ func (t *UploadSubtitleToBilibili) Execute(context map[string]interface{}) bool 
 	types.ReportTaskProgress(context, 30, fmt.Sprintf("找到%d个字幕文件", len(subtitleFiles)))
 
 	// 4. 创建 Bilibili 客户端和字幕上传器
-	client := bilibili.NewClient(bilibiliutil.BuildOptions(t.App.Config, 2*time.Minute)...)
+	client, err := bilibiliutil.NewSubtitleClient(t.App.Config)
+	if err != nil {
+		context["error"] = err.Error()
+		return false
+	}
+	defer client.GetHTTPClient().CloseIdleConnections()
 	uploader := bilibili.NewSubtitleUploader(client, loginInfo)
 
 	// 5. 上传字幕文件
@@ -123,6 +127,13 @@ func (t *UploadSubtitleToBilibili) Execute(context map[string]interface{}) bool 
 		t.App.Logger.Infof("✅ 字幕上传成功: %s (%s)", filepath.Base(subtitleFile.Path), subtitleFile.Language)
 		uploadedCount++
 		types.ReportTaskProgress(context, 40+(uploadedCount*45/len(subtitleFiles)), fmt.Sprintf("已上传字幕 %d/%d", uploadedCount, len(subtitleFiles)))
+	}
+
+	// A partial upload must remain retryable (existing languages are skipped on retry).
+	if len(uploadErrors) > 0 {
+		context["subtitle_upload_count"] = uploadedCount
+		context["error"] = "字幕上传未全部完成: " + strings.Join(uploadErrors, "; ")
+		return false
 	}
 
 	// 6. 记录结果

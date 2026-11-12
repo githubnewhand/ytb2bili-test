@@ -908,13 +908,11 @@ func (h *VideoHandler) manualUploadSubtitle(c *gin.Context) {
 
 	h.App.Logger.Infof("🚀 用户手动触发字幕上传: %s (%s)", savedVideo.VideoID, savedVideo.Title)
 
-	// 更新状态为上传字幕中
-	if err := h.SavedVideoService.UpdateStatus(savedVideo.ID, "301"); err != nil {
-		h.App.Logger.Errorf("更新视频状态失败: %v", err)
-		c.JSON(http.StatusInternalServerError, VideoListResponse{
-			Code:    500,
-			Message: "更新视频状态失败",
-		})
+	// Claim only if an automatic/manual upload has not started meanwhile.
+	claim := h.TaskStepService.DB.Model(&model.SavedVideo{}).
+		Where("id = ? AND status IN ?", savedVideo.ID, []string{"300", "399"}).Update("status", "301")
+	if claim.Error != nil || claim.RowsAffected == 0 {
+		c.JSON(http.StatusConflict, VideoListResponse{Code: 409, Message: "字幕上传已开始或状态已变化，请刷新"})
 		return
 	}
 

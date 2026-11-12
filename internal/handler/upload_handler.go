@@ -29,7 +29,7 @@ func NewUploadHandler(app *core.AppServer) *UploadHandler {
 }
 
 func (h *UploadHandler) newUploadClient(loginInfo *bilibili2.LoginInfo) *bilibili2.UploadClient {
-	return bilibili2.NewUploadClient(loginInfo, bilibiliutil.BuildOptions(h.App.Config, manualUploadAPITimeout)...)
+	return bilibili2.NewUploadClient(loginInfo, bilibiliutil.VideoUploadOptions(manualUploadAPITimeout)...)
 }
 
 // RegisterRoutes 注册上传相关路由

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/difyz9/ytb2bili/internal/core/types"
@@ -124,14 +125,20 @@ func (t *TranslateSubtitle) callOllamaAPI(systemPrompt, userPrompt string) (stri
 	return callOllamaJSON(endpoint, model, timeout, systemPrompt, userPrompt)
 }
 
+// Serialize local inference across subtitle and metadata tasks. Waiting for the
+// model must not consume the HTTP inference timeout.
+var ollamaInferenceMu sync.Mutex
+
 func callOllamaJSON(endpoint, model string, timeout time.Duration, systemPrompt, userPrompt string) (string, error) {
+	ollamaInferenceMu.Lock()
+	defer ollamaInferenceMu.Unlock()
 	payload := map[string]interface{}{
 		"model":      model,
 		"stream":     false,
 		"think":      false,
 		"format":     "json",
 		"keep_alive": "5m",
-		"options":    map[string]interface{}{"temperature": 0, "num_ctx": 4096},
+		"options":    map[string]interface{}{"temperature": 0, "num_ctx": 4096, "num_predict": 2048},
 		"messages": []map[string]string{
 			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": userPrompt},
@@ -147,7 +154,9 @@ func callOllamaJSON(endpoint, model string, timeout time.Duration, systemPrompt,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// This client never reads HTTP(S)_PROXY or the project's external proxy.
-	client := &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: nil}}
+	transport := &http.Transport{Proxy: nil}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: timeout, Transport: transport}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("连接本机 Ollama 失败: %w", err)

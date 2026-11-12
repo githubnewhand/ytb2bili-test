@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type uploadProgressReader struct {
@@ -64,9 +65,13 @@ func (uc *UploadClient) preUpload(fileName string, fileSize int64) (*PreUploadIn
 
 	// 添加必要的参数 - 参考 biliup-rs 的实现
 	params.Set("probe_version", "20221109")
-	// upcdn: bda2 表示使用百度云 CDN
+	// Select the route for this attempt; later attempts can request another CDN.
 	// zone: cs 表示云存储区域
-	params.Set("upcdn", "bda2")
+	cdn := uc.uploadCDN
+	if cdn == "" {
+		cdn = "ws"
+	}
+	params.Set("upcdn", cdn)
 	params.Set("zone", "cs")
 
 	// 获取cookies用于认证
@@ -206,11 +211,14 @@ func (uc *UploadClient) uploadChunks(videoPath string, preInfo *PreUploadInfo, u
 		log.Printf("📤 Uploading chunk %d/%d (%.1f%%) - bytes %d-%d, size=%d",
 			i+1, chunksNum, progress, start, end, len(chunkData))
 
-		err = retryFunc(func() error {
+		err = uc.retryChunk(start, fileSize, i+1, chunksNum, func() error {
 			body := &uploadProgressReader{
 				reader: bytes.NewReader(chunkData),
 				onRead: func(readBytes int64) {
 					uc.reportUploadProgress(start+readBytes, fileSize, i+1, chunksNum)
+					if readBytes == int64(len(chunkData)) {
+						uc.reportChunkState(start, fileSize, i+1, chunksNum, "分片已发送，等待服务器确认")
+					}
 				},
 			}
 			req, err := http.NewRequest("PUT", uploadURL+"?"+params.Encode(), body)
@@ -218,6 +226,8 @@ func (uc *UploadClient) uploadChunks(videoPath string, preInfo *PreUploadInfo, u
 				return fmt.Errorf("failed to create request: %v", err)
 			}
 			req.ContentLength = int64(len(chunkData))
+			// PUT identifies the same uploadId/partNumber, so replaying its body is safe.
+			req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(chunkData)), nil }
 
 			req.Header.Set("X-Upos-Auth", preInfo.Auth)
 			req.Header.Set("Content-Length", strconv.Itoa(len(chunkData)))
@@ -227,7 +237,7 @@ func (uc *UploadClient) uploadChunks(videoPath string, preInfo *PreUploadInfo, u
 			// 使用专门的上传客户端（更长的超时时间）
 			resp, err := uc.uploadClient.Do(req)
 			if err != nil {
-				return fmt.Errorf("network error uploading chunk %d: %v", i+1, err)
+				return fmt.Errorf("network error uploading chunk %d: %w", i+1, err)
 			}
 			defer resp.Body.Close()
 
@@ -298,11 +308,14 @@ func (uc *UploadClient) uploadChunksFromURL(videoURL string, preInfo *PreUploadI
 		log.Printf("📤 Uploading chunk from URL %d/%d (%.1f%%) - bytes %d-%d, size=%d",
 			i+1, chunksNum, progress, start, end, len(chunkData))
 
-		err = retryFunc(func() error {
+		err = uc.retryChunk(start, fileSize, i+1, chunksNum, func() error {
 			body := &uploadProgressReader{
 				reader: bytes.NewReader(chunkData),
 				onRead: func(readBytes int64) {
 					uc.reportUploadProgress(start+readBytes, fileSize, i+1, chunksNum)
+					if readBytes == int64(len(chunkData)) {
+						uc.reportChunkState(start, fileSize, i+1, chunksNum, "分片已发送，等待服务器确认")
+					}
 				},
 			}
 			req, err := http.NewRequest("PUT", uploadURL+"?"+params.Encode(), body)
@@ -310,6 +323,8 @@ func (uc *UploadClient) uploadChunksFromURL(videoURL string, preInfo *PreUploadI
 				return fmt.Errorf("failed to create request: %v", err)
 			}
 			req.ContentLength = int64(len(chunkData))
+			// PUT identifies the same uploadId/partNumber, so replaying its body is safe.
+			req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(chunkData)), nil }
 
 			req.Header.Set("X-Upos-Auth", preInfo.Auth)
 			req.Header.Set("Content-Length", strconv.Itoa(len(chunkData)))
@@ -319,7 +334,7 @@ func (uc *UploadClient) uploadChunksFromURL(videoURL string, preInfo *PreUploadI
 			// 使用专门的上传客户端（更长的超时时间）
 			resp, err := uc.uploadClient.Do(req)
 			if err != nil {
-				return fmt.Errorf("network error uploading chunk %d: %v", i+1, err)
+				return fmt.Errorf("network error uploading chunk %d: %w", i+1, err)
 			}
 			defer resp.Body.Close()
 
@@ -451,4 +466,30 @@ func (uc *UploadClient) completeUpload(preInfo *PreUploadInfo, uploadID string, 
 		Filename: fileNameWithoutExt,
 		Desc:     "",
 	}, nil
+}
+
+func (uc *UploadClient) reportChunkState(start, total int64, index, count int, message string) {
+	if uc.uploadProgress != nil {
+		uc.uploadProgress(UploadProgress{UploadedBytes: start, TotalBytes: total, ChunkIndex: index, TotalChunks: count, Percent: float64(start) * 100 / float64(total), Message: message})
+	}
+}
+
+func (uc *UploadClient) retryChunk(start, total int64, index, count int, fn func() error) error {
+	var last error
+	for attempt := 1; attempt <= 3; attempt++ {
+		uc.reportChunkState(start, total, index, count, fmt.Sprintf("上传分片 %d/%d（尝试 %d/3）", index, count, attempt))
+		last = fn()
+		if last == nil {
+			return nil
+		}
+		// Only transient network / storage server errors can be retried.
+		message := strings.ToLower(last.Error())
+		transient := IsNetworkError(last) || strings.Contains(message, "status 500 ") || strings.Contains(message, "status 502 ") || strings.Contains(message, "status 503 ") || strings.Contains(message, "status 504 ") || strings.Contains(message, "status 429 ")
+		if attempt == 3 || !transient {
+			return last
+		}
+		uc.reportChunkState(start, total, index, count, fmt.Sprintf("分片 %d/%d 失败，%d秒后重试（%d/3）", index, count, attempt*3, attempt+1))
+		time.Sleep(time.Duration(attempt*3) * time.Second)
+	}
+	return last
 }
