@@ -385,6 +385,14 @@ func (t *TranslateSubtitle) buildSubtitleTranslationItemGroups(items []subtitleT
 		groupSize = maximumTranslationGroupSize
 	}
 
+	maxChars := maximumTranslationGroupChars
+	if t.App != nil && subtitleTranslationProvider(t.App.Config) == "ollama" {
+		if groupSize > 8 {
+			groupSize = 8
+		}
+		maxChars = 800
+	}
+
 	var groups [][]subtitleTranslationItem
 	var current []subtitleTranslationItem
 	currentChars := 0
@@ -399,7 +407,7 @@ func (t *TranslateSubtitle) buildSubtitleTranslationItemGroups(items []subtitleT
 	}
 	for _, item := range items {
 		itemChars := len([]rune(item.Text)) + len(item.ID) + 6
-		if len(current) > 0 && (len(current) >= groupSize || currentChars+itemChars > maximumTranslationGroupChars) {
+		if len(current) > 0 && (len(current) >= groupSize || currentChars+itemChars > maxChars) {
 			flush()
 		}
 		current = append(current, item)

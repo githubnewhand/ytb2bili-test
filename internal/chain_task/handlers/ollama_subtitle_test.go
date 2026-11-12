@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -190,5 +192,92 @@ func TestParseSRTDoesNotMergeEmptyAutoCaptionCue(t *testing.T) {
 	entries, err := (&TranslateSubtitle{}).parseSRTContent(input)
 	if err != nil || len(entries) != 2 || entries[0].Index != 1 || entries[1].Index != 3 || entries[1].Text != "Goodbye." {
 		t.Fatalf("blank cue swallowed its neighbor: %+v, %v", entries, err)
+	}
+}
+
+func TestOllamaTimeoutSplitsAndRecovers(t *testing.T) {
+	var sizes []int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		var input map[string]string
+		json.Unmarshal([]byte(req.Messages[1].Content), &input)
+		sizes = append(sizes, len(input))
+		if len(input) > 1 {
+			<-r.Context().Done()
+			return
+		}
+		output := map[string]string{}
+		for id := range input {
+			output[id] = "有效译文"
+		}
+		payload, _ := json.Marshal(output)
+		json.NewEncoder(w).Encode(map[string]interface{}{"message": map[string]string{"content": string(payload)}})
+	}))
+	defer server.Close()
+	translator := &TranslateSubtitle{App: &core.AppServer{Config: &types.AppConfig{
+		SubtitleTranslationConfig: &types.SubtitleTranslationConfig{Provider: "ollama", OllamaURL: server.URL, Timeout: 1},
+	}}}
+	got, err := translator.translateSubtitleItemGroupResilient([]subtitleTranslationItem{
+		{ID: "T000001", Text: "Hello there."}, {ID: "T000002", Text: "Good morning."},
+	})
+	if err != nil || len(got) != 2 || fmt.Sprint(sizes) != "[2 1 1]" {
+		t.Fatalf("timeout recovery: got=%v sizes=%v err=%v", got, sizes, err)
+	}
+}
+
+func TestOllamaSmallBatches(t *testing.T) {
+	translator := &TranslateSubtitle{GroupSize: 50, App: &core.AppServer{Config: &types.AppConfig{
+		SubtitleTranslationConfig: &types.SubtitleTranslationConfig{Provider: "ollama"},
+	}}}
+	var items []subtitleTranslationItem
+	for i := 0; i < 30; i++ {
+		items = append(items, subtitleTranslationItem{ID: fmt.Sprint(i), Text: strings.Repeat("a", 120)})
+	}
+	groups := translator.buildSubtitleTranslationItemGroups(items)
+	total := 0
+	for _, group := range groups {
+		chars := 0
+		for _, item := range group {
+			chars += len([]rune(item.Text)) + len(item.ID) + 6
+		}
+		if len(group) > 8 || chars > 800 {
+			t.Fatalf("oversized group: %d, %d", len(group), chars)
+		}
+		total += len(group)
+	}
+	if total != len(items) {
+		t.Fatal("lost items")
+	}
+}
+
+func TestOllamaSerializesAcrossTasks(t *testing.T) {
+	var active, peak atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := active.Add(1)
+		defer active.Add(-1)
+		for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
+		}
+		time.Sleep(20 * time.Millisecond)
+		fmt.Fprint(w, `{"message":{"content":"{}"}}`)
+	}))
+	defer server.Close()
+	var workers sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			if _, err := callOllamaJSON(server.URL, "test", time.Second, "system", "user"); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	workers.Wait()
+	if peak.Load() != 1 {
+		t.Fatalf("concurrent local inference: %d", peak.Load())
 	}
 }

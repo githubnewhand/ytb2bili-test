@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -609,6 +611,11 @@ func (t *TranslateSubtitle) translateGroupResilient(texts []string) ([]string, e
 
 func (t *TranslateSubtitle) isFatalTranslationError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// A slow local generation is recoverable by splitting the batch.
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
 		return false
 	}
 	errorStr := strings.ToLower(err.Error())
